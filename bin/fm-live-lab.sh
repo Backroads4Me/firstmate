@@ -23,23 +23,20 @@
 # lab primary, by default; mate and worker name the lab's own tasks). pane
 # prints a window's recent scrollback. down stops every lab process, removes the
 # lab's Claude trust entries by one atomic replace, removes <lab-root>, and exits
-# non-zero if anything outside the lab changed.
+# non-zero if the recorded Pi trust store or ~/.treehouse gained changes.
 #
-# What up builds, and the recorded lab miss each part closes:
+# What up builds:
 #   home/            the lab main home: bin/fm-lab-home.sh create, then the
 #                    committed tree <ref> of <source> (default: HEAD of the
 #                    checkout this script runs from) checked out as a genuine
-#                    primary checkout, with FM_HOME at its root. A primary
-#                    launched from a linked worktree or from an operational home
-#                    that is not the tree's root had no dialog mirror.
+#                    primary checkout, with FM_HOME at its root.
 #   config/          backend tmux, Claude crews and second mates, and
 #                    supervision-host <line> (default claude on Claude, absent
 #                    on Pi; none leaves the file absent).
 #   tmux server      private, through the lab home's bin/fm-lab-home.sh
 #                    tmux-dir, with no user tmux config (its plugins never run
 #                    in a lab), started from an empty environment so no inherited
-#                    TMUX, Herdr, or Pi marker reaches a lab process (a probe
-#                    that inherited the caller's Pi marker was discarded).
+#                    TMUX, Herdr, or Pi marker reaches a lab process.
 #                    TREEHOUSE_ROOT points into <lab-root>, so a worker's pool
 #                    never lands in ~/.treehouse, and DISABLE_AUTOUPDATER=1
 #                    keeps Claude Code from replacing the shared binary under
@@ -49,12 +46,11 @@
 #                    ~/.treehouse it selected, so check and down use those same
 #                    paths even from a later shell with another HOME.
 #   trust            Claude: bin/fm-claude-trust.sh --lab-home for the primary
-#                    (the workspace-trust prompt wedged the first lab), and the
-#                    spawn's own registration for the mate and worker. Pi:
+#                    and the spawn's own registration for the mate and worker. Pi:
 #                    --approve, which trusts project-local files for this run
 #                    only, so the Pi trust store is never written and all of
-#                    .pi/extensions loads (one Pi lab lacked the branch
-#                    extension); sessions stay under <lab-root>/pi-sessions.
+#                    .pi/extensions loads; sessions stay under
+#                    <lab-root>/pi-sessions.
 #   task ids         lab<nonce>-mate and lab<nonce>-worker, unique per lab,
 #                    because a spawn keeps a task temp dir at /tmp/fm-<id>
 #                    that a fixed id would share with other labs and tasks.
@@ -68,8 +64,7 @@
 #                    it to let the worker finish.
 #   primary          window main: claude --setting-sources project,local
 #                    (default sonnet, medium, permission mode auto) or pi
-#                    (default openai-codex/gpt-6-luna, medium; three older
-#                    Codex models were rejected by the account), launched
+#                    (default openai-codex/gpt-6-luna, medium), launched
 #                    after the mate and worker so its first turn end arms
 #                    supervision. up then sends one harmless probe prompt.
 #
@@ -82,9 +77,7 @@
 #                 Pi: the Pi trust store is byte-identical to before up.
 #   mirror        Claude with --expect-host yes: the tree's
 #                 fm-host-mirror.sh verified claude and fm-host-mirror.sh check
-#                 pass, and the mirror holds a captain and a main entry (the
-#                 feed was once not wired, and once the check existed only on
-#                 an unmerged branch; a missing subcommand fails here by name).
+#                 pass, and the mirror holds a captain and a main entry.
 #   extensions    Pi: the watcher, turn-end guard, and branch extensions are
 #                 loaded by the process holding the lab session lock, at the
 #                 current on-disk builds.

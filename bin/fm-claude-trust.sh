@@ -148,10 +148,10 @@
 # are never written there.
 #
 # LAB-HOME MODE. A disposable lab primary (bin/fm-live-lab.sh) launches in a lab
-# home that is neither a task worktree nor a seeded secondmate home, and its
-# trust dialog was a recorded lab miss. The evidence is again structural: the
-# home must carry bin/fm-lab-home.sh's marker (a regular file this user owns,
-# never a symlink, holding the token bin/fm-gate-refuse-lib.sh owns), hold
+# home that is neither a task worktree nor a seeded secondmate home.
+# The evidence is structural: the home must carry bin/fm-lab-home.sh's marker
+# (a regular file this user owns, never a symlink, holding the token
+# bin/fm-gate-refuse-lib.sh owns), hold
 # AGENTS.md and bin/, and be a primary git checkout whose top level is exactly
 # the argument, because Claude Code keys the launch to that root. It is
 # trust-only for the same reason as a secondmate home, and bin/fm-live-lab.sh
@@ -163,9 +163,9 @@
 # file this uid owns; every unrelated key and project entry is preserved, and
 # both entries land in one atomic replacement. In secondmate-home and lab-home
 # mode: the single projects entry for the registered home path, same store,
-# same atomic replacement. fm-spawn.sh forwards CLAUDE_CONFIG_DIR onto the claude launch
-# verbatim rather than resolving it, and the pane starts in the registered
-# directory, so only an absolute value names the same store on both sides; a
+# same atomic replacement. fm-spawn.sh forwards CLAUDE_CONFIG_DIR onto the
+# claude launch verbatim rather than resolving it, and the pane starts in the
+# registered directory, so only an absolute value names the same store on both sides; a
 # relative one is refused below rather than guessed at.
 set -u
 # Path resolution here must answer from the filesystem, never from the caller's
