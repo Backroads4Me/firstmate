@@ -404,6 +404,38 @@ kill -0 "$REUSED" 2>/dev/null || fail "down killed a reused PID"
 kill -0 "$REUSED_CHILD" 2>/dev/null || fail "down killed the reused PID's child"
 pass "down ignores roots with mismatched start times"
 
+# Simulate a recorded PID changing identity after TERM: the first process
+# snapshot matches its start time, subsequent snapshots describe a reused PID.
+Z=$(make_lab z claude)
+python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)' &
+REPLACED=$!
+printf '%s\n' "$REPLACED" >> "$TMP_ROOT/pids"
+record_pid "$Z" "$REPLACED"
+mkdir -p "$TMP_ROOT/ps-bin"
+printf '%s\n' "$REPLACED" > "$TMP_ROOT/replaced-pid"
+cat > "$TMP_ROOT/ps-bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -axo ]; then
+  count=$(cat "$PS_COUNT" 2>/dev/null || echo 0)
+  echo "$((count + 1))" > "$PS_COUNT"
+  if [ "$count" -gt 0 ]; then
+    "$REAL_PS" "$@" | awk -v target="$(cat "$PS_TARGET")" '$1 == target {$3="Mon"; $4="Jan"; $5="1"; $6="00:00:00"; $7="1990"} {print}'
+  else
+    "$REAL_PS" "$@"
+  fi
+else
+  "$REAL_PS" "$@"
+fi
+SH
+chmod +x "$TMP_ROOT/ps-bin/ps"
+start=$(date +%s)
+out=$(REAL_PS="$(command -v ps)" PS_COUNT="$TMP_ROOT/ps-count" PS_TARGET="$TMP_ROOT/replaced-pid" PATH="$TMP_ROOT/ps-bin:$PATH" "$LIVE_LAB" down "$Z" 2>&1)
+expect_code 0 "$?" "down must not treat the changed PID as a survivor: $out"
+[ "$(( $(date +%s) - start ))" -lt 8 ] || fail "down waited on a PID with a different start time"
+kill -0 "$REPLACED" 2>/dev/null || fail "down killed a PID after its recorded identity changed"
+kill "$REPLACED" 2>/dev/null || true
+pass "down revalidates process identity during its bounded wait"
+
 printf '{"trusted":["/somewhere"]}\n' > "$HOME/.pi/agent/trust.json"
 run_check "$P"
 assert_contains "$CHECK_OUT" "fail trust: the Pi trust store changed since up began" "a written Pi trust store is caught"
@@ -455,6 +487,48 @@ cp "$ROOT/AGENTS.md" "$UPSRC/AGENTS.md"
 git -C "$UPSRC" init -q -b main
 git -C "$UPSRC" add -A
 git -C "$UPSRC" -c user.name=t -c user.email=t@example.invalid commit -qm source
+# A worker can have written its first status while still working. That must
+# not hold up the Claude primary; the generated brief must ask it to end its
+# turn on the gate instead of running a foreground polling command.
+WORKSRC="$TMP_ROOT/worker-source"
+cp -R "$UPSRC" "$WORKSRC"
+cat > "$WORKSRC/bin/fm-brief.sh" <<'SH'
+#!/usr/bin/env bash
+mkdir -p "$FM_HOME/data/$1"
+printf '{TASK}\n{FIRSTMATE_SPEC}\n' > "$FM_HOME/data/$1/brief.md"
+SH
+cat > "$WORKSRC/bin/fm-tasks-axi.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+cat > "$WORKSRC/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+id=$1
+tmux new-window -d -t firstmate: -n "fm-$id" -c "$FM_HOME" 'exec sleep 600'
+printf 'window=firstmate:fm-%s\n' "$id" > "$FM_HOME/state/$id.meta"
+printf 'working [at=1]: setting up\n' > "$FM_HOME/state/$id.status"
+SH
+chmod +x "$WORKSRC/bin/"{fm-brief,fm-tasks-axi,fm-spawn}.sh
+git -C "$WORKSRC" add -A
+git -C "$WORKSRC" -c user.name=t -c user.email=t@example.invalid commit -qm stubs
+W="$TMP_ROOT/worker-up"
+out=$(PATH="$TMP_ROOT/stub-bin:$PATH" "$LIVE_LAB" up --harness claude --worker --source "$WORKSRC" --timeout 0 "$W" 2>&1)
+expect_code 1 "$?" "unanswered probe leaves worker lab for inspection: $out"
+assert_contains "$out" "primary: claude" "the unparked worker did not block primary launch"
+assert_contains "$out" "gate: $W/home/data/" "up shows the gate path"
+assert_contains "$out" "then message the worker to resume" "up explains the release message"
+worker_id=$(sed -n 's/^worker_id=//p' "$W/.fm-live-lab")
+brief=$(<"$W/home/data/$worker_id/brief.md")
+assert_contains "$brief" "append one paused status line naming the gate file" "worker declares its wait"
+assert_contains "$brief" "and end your turn" "worker ends its waiting turn"
+assert_contains "$brief" "Do not poll or sleep in a foreground command" "worker does not run a blocking wait"
+assert_contains "$brief" "When a later message resumes you, check that" "worker checks the gate after a message"
+assert_contains "$out" "fail worker: the worker is not currently parked" "final readiness remains strict"
+node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));process.exit(j.projects?.[process.argv[2]]?.hasTrustDialogAccepted===true?0:1)' "$HOME/.claude.json" "$W/home" || fail "primary trust was not registered before launch"
+out=$("$LIVE_LAB" down "$W" 2>&1)
+expect_code 0 "$?" "down cleans the worker lab: $out"
+pass "up launches primary after worker status without weakening final parked readiness"
+
 FAKEBIN="$TMP_ROOT/fakebin"
 mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/claude" <<'SH'

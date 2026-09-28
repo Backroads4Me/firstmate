@@ -61,7 +61,7 @@
 #                    (local-only +yolo), a scaffolded brief, a backlog item, and
 #                    a real bin/fm-spawn.sh worker that parks on
 #                    <lab-root>/home/data/<worker-id>/gate until that file
-#                    exists; touch it to let the worker finish.
+#                    exists; touch the gate and message the worker to resume.
 #   primary          window main: claude --setting-sources project,local
 #                    (default sonnet, medium, permission mode auto) or pi
 #                    (default openai-codex/gpt-6-luna, medium), launched
@@ -418,8 +418,8 @@ spawn_worker() {
   local brief="$LAB/data/$WORKER_ID/brief.md" gate="$GATE"
   make_notes_project || return 1
   (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-brief.sh" "$WORKER_ID" notes --mode local-only) >/dev/null || return 1
-  TASK_TEXT="Lab gated worker for a live supervision lab. Add count_notes(), which returns how many notes are stored, to notes/__init__.py with a unit test, but only after the gate file $gate exists." \
-  SPEC_TEXT="Right after setup, append one paused status line that names the gate file $gate, then check for that file every 15 seconds and do nothing else until it exists. Then implement count_notes() in notes/__init__.py and a test in tests/test_notes.py, run python3 -m unittest discover -s tests, commit, and report done. Nothing else is in scope." \
+  TASK_TEXT="Lab gated worker for a live supervision lab. Add count_notes(), which returns how many notes are stored, to notes/__init__.py with a unit test, but only after the gate file $gate exists and you receive a message to resume." \
+  SPEC_TEXT="Right after setup, append one paused status line naming the gate file $gate and end your turn. Do not poll or sleep in a foreground command. When a later message resumes you, check that $gate exists before implementing count_notes() in notes/__init__.py and a test in tests/test_notes.py; if it is absent, remain paused and end your turn again. Once the gate exists, run python3 -m unittest discover -s tests, commit, and report done. Nothing else is in scope." \
     python3 - "$brief" <<'PY' || return 1
 import os, sys
 path = sys.argv[1]
@@ -531,17 +531,17 @@ cmd_up() {
   if [ "$worker" = yes ]; then
     spawn_worker || die "cannot launch the gated worker"
     record_launch_pid "$(window_field worker '#{pane_pid}')"
-    echo "gate: $GATE (touch to release the worker)"
+    echo "gate: $GATE (touch, then message the worker to resume)"
   fi
 
   local -a primary=()
   if [ "$harness" = claude ]; then
-    local settle=$(( $(date +%s) + 300 )) attempt
-    until { [ "$mate" != yes ] || check_mate >/dev/null; } && { [ "$worker" != yes ] || check_worker >/dev/null; }; do
-      [ "$(date +%s)" -lt "$settle" ] || die "mate or worker did not become ready before Claude primary trust registration"
+    local settle=$(( $(date +%s) + 300 )) retry
+    until { [ "$mate" != yes ] || check_mate >/dev/null; } && { [ "$worker" != yes ] || [ -s "$LAB/state/$WORKER_ID.status" ]; }; do
+      [ "$(date +%s)" -lt "$settle" ] || break
       sleep 2
     done
-    for attempt in 1 2 3; do
+    for (( retry=0; retry<3; retry++ )); do
       lab_run "$CLAUDE_TRUST" --lab-home "$LAB" >/dev/null || die "cannot register Claude trust for the lab home"
       sleep 1
       lab_trust_present && break
@@ -680,7 +680,7 @@ cmd_down() {
     kill $pids 2>/dev/null || true
   fi
   for n in {1..40}; do
-    survivors=$(live_pids "$pids $(lab_pids)")
+    survivors=$(live_pids "$(lab_pids)")
     [ -n "$survivors" ] || break
     if [ "$n" -eq 20 ]; then
       # shellcheck disable=SC2086 # One pid per word.
@@ -688,7 +688,7 @@ cmd_down() {
     fi
     sleep 0.5
   done
-  survivors=$(live_pids "$pids $(lab_pids)")
+  survivors=$(live_pids "$(lab_pids)")
   [ -z "$survivors" ] || die "refusing to remove the lab: its processes did not exit: $(echo "$survivors" | tr '\n' ' ')"
   echo "stopped: lab tmux server and lab processes"
   # A spawn keeps /tmp/fm-<id> and /tmp/fm-<id>+<sha256 of the spawning home>.
