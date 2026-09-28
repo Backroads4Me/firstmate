@@ -60,8 +60,8 @@
 #   worker           --worker: a lab project notes with a lab-private origin
 #                    (local-only +yolo), a scaffolded brief, a backlog item, and
 #                    a real bin/fm-spawn.sh worker that parks on
-#                    <lab-root>/gates/<worker-id> until that file exists; touch
-#                    it to let the worker finish.
+#                    <lab-root>/home/data/<worker-id>/gate until that file
+#                    exists; touch it to let the worker finish.
 #   primary          window main: claude --setting-sources project,local
 #                    (default sonnet, medium, permission mode auto) or pi
 #                    (default openai-codex/gpt-6-luna, medium), launched
@@ -88,12 +88,11 @@
 #                 (skipped on an empty fleet).
 #   mate          --mate: its window is alive and its own session lock names a
 #                 live process, so it got past trust into its charter.
-#   worker        --worker: the worker declared its gate wait in its status.
+#   worker        --worker: its current crew state is paused on the gate.
 #   treehouse     ~/.treehouse gained no entry since up began.
 #
 # down refuses any path without the lab record up writes. It kills only the
-# lab's private tmux server, the processes whose command line names <lab-root>
-# as a whole path (never a sibling such as <lab-root>2), and their descendants;
+# lab's recorded private tmux server and launch pane PIDs, and their descendants;
 # runs bin/fm-lab-home.sh teardown; removes the task temp and launch dirs the
 # lab's spawns kept under /tmp, including a failed spawn's; removes every
 # project entry at or under <lab-root> from the recorded Claude store, following
@@ -146,6 +145,7 @@ load_lab() {  # <root>: refuse anything up did not build, then load its record
   NONCE=$(rec_get "$ROOT" nonce)
   MATE_ID=$(rec_get "$ROOT" mate_id)
   WORKER_ID=$(rec_get "$ROOT" worker_id)
+  GATE=$(rec_get "$ROOT" gate)
   PI_TRUST_BEFORE=$(rec_get "$ROOT" pi_trust)
   CLAUDE_DIR=$(rec_get "$ROOT" claude_config_dir)
   CLAUDE_STORE=$(rec_get "$ROOT" claude_store)
@@ -314,10 +314,14 @@ check_mate() {
 }
 
 check_worker() {
+  local state
   window_alive worker || { echo "fail worker: the $WORKER_ID window is not running"; return 1; }
-  grep -E '^paused' "$LAB/state/$WORKER_ID.status" 2>/dev/null | grep -Fq "$ROOT/gates/$WORKER_ID" \
-    || { echo "fail worker: the worker has not declared its gate wait yet"; return 1; }
-  echo "ok worker: $WORKER_ID parked on $ROOT/gates/$WORKER_ID"
+  state=$(cd "$LAB" && lab_run FM_HOME="$LAB" FM_CREW_STATE_NO_FORGE=1 "$LAB/bin/fm-crew-state.sh" "$WORKER_ID" 2>/dev/null)
+  case "$state" in
+    "state: paused · "*"$GATE"*) ;;
+    *) echo "fail worker: the worker is not currently parked on $GATE (${state:-no state})"; return 1 ;;
+  esac
+  echo "ok worker: $WORKER_ID parked on $GATE"
 }
 
 check_treehouse() {
@@ -407,8 +411,7 @@ MD
 }
 
 spawn_worker() {
-  local brief="$LAB/data/$WORKER_ID/brief.md" gate="$ROOT/gates/$WORKER_ID"
-  mkdir -p "$ROOT/gates"
+  local brief="$LAB/data/$WORKER_ID/brief.md" gate="$GATE"
   make_notes_project || return 1
   (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-brief.sh" "$WORKER_ID" notes --mode local-only) >/dev/null || return 1
   TASK_TEXT="Lab gated worker for a live supervision lab. Add count_notes(), which returns how many notes are stored, to notes/__init__.py with a unit test, but only after the gate file $gate exists." \
@@ -475,8 +478,9 @@ cmd_up() {
   ROOT=$(real_dir "$root")
   LAB="$ROOT/home"
   HARNESS=$harness EXPECT_HOST=$expect_host WANT_MATE=$mate WANT_WORKER=$worker
-  NONCE=$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')
-  MATE_ID="lab${NONCE:0:6}-mate" WORKER_ID="lab${NONCE:0:6}-worker"
+  NONCE=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+  MATE_ID="lab${NONCE:0:12}-mate" WORKER_ID="lab${NONCE:0:12}-worker"
+  GATE="$LAB/data/$WORKER_ID/gate"
   PI_TRUST_BEFORE=$(digest "$PI_TRUST_STORE")
   treehouse_listing | sort > "$ROOT/.treehouse-before"
   {
@@ -489,6 +493,7 @@ cmd_up() {
     echo "nonce=$NONCE"
     echo "mate_id=$MATE_ID"
     echo "worker_id=$WORKER_ID"
+    echo "gate=$GATE"
     echo "pi_trust=$PI_TRUST_BEFORE"
     echo "claude_config_dir=$CLAUDE_DIR"
     echo "claude_store=$CLAUDE_STORE"
@@ -513,9 +518,17 @@ cmd_up() {
   TMUX_DIR=$("$LAB_HOME_HELPER" tmux-dir "$LAB") || die "cannot create the private tmux directory"
   echo "tmux_dir=$TMUX_DIR" >> "$ROOT/$RECORD_NAME"
   lab_run tmux -f /dev/null new-session -d -s firstmate -n lab -x 220 -y 60 -c "$ROOT" || die "cannot start the lab tmux server"
+  echo "launch_pid=$(lab_tmux display-message -p '#{pid}')" >> "$ROOT/$RECORD_NAME"
 
-  if [ "$mate" = yes ]; then spawn_mate || die "cannot seed and launch the second mate"; fi
-  if [ "$worker" = yes ]; then spawn_worker || die "cannot launch the gated worker"; fi
+  if [ "$mate" = yes ]; then
+    spawn_mate || die "cannot seed and launch the second mate"
+    echo "launch_pid=$(window_field mate '#{pane_pid}')" >> "$ROOT/$RECORD_NAME"
+  fi
+  if [ "$worker" = yes ]; then
+    spawn_worker || die "cannot launch the gated worker"
+    echo "launch_pid=$(window_field worker '#{pane_pid}')" >> "$ROOT/$RECORD_NAME"
+    echo "gate: $GATE (touch to release the worker)"
+  fi
 
   local -a primary=()
   if [ "$harness" = claude ]; then
@@ -528,6 +541,7 @@ cmd_up() {
     env FM_HOME="$LAB" CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false "${primary[@]}" \
     || die "cannot launch the lab primary"
   lab_tmux set-option -w -t "$(window_id main)" remain-on-exit on >/dev/null
+  echo "launch_pid=$(window_field main '#{pane_pid}')" >> "$ROOT/$RECORD_NAME"
   echo "primary: ${primary[*]}"
 
   local deadline=$(( $(date +%s) + 180 ))
@@ -550,38 +564,23 @@ cmd_up() {
 
 # ---- down -------------------------------------------------------------------
 
-# lab_pids: processes whose command line names the lab root as a whole path
-# (the root itself or a path under it, never a sibling that merely shares its
-# prefix), and every descendant of one (a child such as an engine turn need not
-# name the root), never this script's own ancestry or descendants.
+# lab_pids: only recorded launch PIDs and their descendants. Resolve the tree
+# before killing tmux, while pane children still have their original parents.
 lab_pids() {
-  ps -axo pid=,ppid=,command= | awk -v self=$$ -v a="$ROOT" -v b="${ROOT#/private}" -v lead=" =:\"'" -v trail="/ :\"'" '
-    function names(s, r,   start, i, pre, post) {
-      for (start = 1; (i = index(substr(s, start), r)) > 0; start = i + 1) {
-        i += start - 1
-        pre = i > 1 ? substr(s, i - 1, 1) : ""
-        post = substr(s, i + length(r), 1)
-        if ((pre == "" || index(lead, pre)) && (post == "" || index(trail, post))) return 1
+  ps -axo pid=,ppid= | awk -v record="$ROOT/$RECORD_NAME" '
+    BEGIN {
+      while ((getline line < record) > 0) {
+        if (line ~ /^launch_pid=[0-9]+$/) { sub(/^launch_pid=/, "", line); roots[line] = 1 }
       }
-      return 0
+      close(record)
     }
-    { pid[NR]=$1; ppid[$1]=$2; line=$0; sub(/^ *[0-9]+ +[0-9]+ /, "", line); cmd[$1]=line }
+    { pid[NR]=$1; ppid[$1]=$2 }
     END {
-      for (p = self; p > 1 && (p in ppid); p = ppid[p]) own[p] = 1
       for (i = 1; i <= NR; i++) {
         p = pid[i]
-        for (q = ppid[p]; q > 1 && (q in ppid); q = ppid[q]) if (q == self) break
-        if (q == self) own[p] = 1
-      }
-      for (i = 1; i <= NR; i++) {
-        p = pid[i]
-        if (p in own) continue
-        if (names(cmd[p], a) || names(cmd[p], b)) named[p] = 1
-      }
-      for (i = 1; i <= NR; i++) {
-        p = pid[i]
-        if (p in own) continue
-        for (q = p; q > 1 && (q in ppid); q = ppid[q]) if (q in named) { print p; break }
+        for (q = p; q > 1 && (q in ppid); q = ppid[q]) {
+          if (q in roots) { print p; break }
+        }
       }
     }'
 }
@@ -636,16 +635,14 @@ NODE
 
 cmd_down() {
   load_lab "${1:-}"
-  local rc=0 pids n=0 removed added id meta dir home_hash
+  local rc=0 pids removed added id meta dir home_hash
   local -a ids=()
-  lab_tmux kill-server 2>/dev/null || true
-  while pids=$(lab_pids) && [ -n "$pids" ] && [ "$n" -lt 20 ]; do
-    # shellcheck disable=SC2086 # One pid per word.
-    if [ "$n" -lt 10 ]; then kill $pids 2>/dev/null; else kill -9 $pids 2>/dev/null; fi
-    n=$((n + 1)); sleep 1
-  done
   pids=$(lab_pids)
-  [ -z "$pids" ] || die "refusing to remove the lab: processes still name it: $(printf '%s' "$pids" | tr '\n' ' ')"
+  lab_tmux kill-server 2>/dev/null || true
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086 # One pid per word, captured before tmux reparents panes.
+    kill $pids 2>/dev/null || true
+  fi
   echo "stopped: lab tmux server and lab processes"
   # A spawn keeps /tmp/fm-<id> and /tmp/fm-<id>+<sha256 of the spawning home>.
   # The second is scoped to this lab home for any task it spawned; the first is

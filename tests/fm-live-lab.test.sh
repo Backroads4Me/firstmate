@@ -54,7 +54,7 @@ make_lab() {
   "$ROOT/bin/fm-lab-home.sh" create "$home" >/dev/null || fail "lab home create"
   cp -R "$ROOT/bin" "$home/bin"
   cp "$ROOT/AGENTS.md" "$home/AGENTS.md"
-  mkdir -p "$home/.pi" "$root/mate/state" "$root/gates" "$root/treehouse"
+  mkdir -p "$home/.pi" "$home/data/$WORKER_ID" "$root/mate/state" "$root/treehouse"
   cp -R "$ROOT/.pi/extensions" "$home/.pi/extensions"
   git -C "$home" init -q -b main
   git -C "$home" add -A bin AGENTS.md .pi
@@ -72,6 +72,7 @@ make_lab() {
     echo "nonce=$NONCE"
     echo "mate_id=$MATE_ID"
     echo "worker_id=$WORKER_ID"
+    echo "gate=$home/data/$WORKER_ID/gate"
     echo "pi_trust=$(digest "$HOME/.pi/agent/trust.json")"
     echo "claude_config_dir=$claude_dir"
     echo "claude_store=${claude_dir:-$HOME}/.claude.json"
@@ -81,12 +82,14 @@ make_lab() {
   } > "$root/.fm-live-lab"
 
   lab_tmux "$root" new-session -d -s firstmate -n lab -c "$root" 'exec sleep 600'
+  printf 'launch_pid=%s\n' "$(lab_tmux "$root" display-message -p '#{pid}')" >> "$root/.fm-live-lab"
   lab_tmux "$root" new-window -d -t firstmate: -n main -c "$home" "printf 'LABREADY-$NONCE\n'; exec sleep 600"
   lab_tmux "$root" new-window -d -t firstmate: -n "fm-$MATE_ID" -c "$root/mate" 'exec sleep 600'
   lab_tmux "$root" new-window -d -t firstmate: -n "fm-$WORKER_ID" -c "$root" 'exec sleep 600'
   fm_write_meta "$home/state/$MATE_ID.meta" "window=firstmate:fm-$MATE_ID" "tasktmp=/tmp/fm-$MATE_ID"
-  fm_write_meta "$home/state/$WORKER_ID.meta" "window=firstmate:fm-$WORKER_ID" "tasktmp=/tmp/fm-$WORKER_ID"
-  printf 'paused [at=1]: waiting on gate file %s to exist\n' "$root/gates/$WORKER_ID" > "$home/state/$WORKER_ID.status"
+  fm_write_meta "$home/state/$WORKER_ID.meta" "window=firstmate:fm-$WORKER_ID" "worktree=$home/projects/notes" "kind=secondmate" "tasktmp=/tmp/fm-$WORKER_ID"
+  mkdir -p "$home/projects/notes"
+  printf 'paused [at=1]: waiting on gate file %s to exist\n' "$home/data/$WORKER_ID/gate" > "$home/state/$WORKER_ID.status"
 
   lock_pid=$(lab_tmux "$root" display-message -p -t firstmate:=main '#{pane_pid}')
   printf '%s\n' "$lock_pid" > "$home/state/.lock"
@@ -240,12 +243,20 @@ assert_contains "$CHECK_OUT" "fail mate: the mate holds no session lock yet" "ma
 lab_tmux "$C" display-message -p -t "firstmate:=fm-$MATE_ID" '#{pane_pid}' > "$C/mate/state/.lock"
 pass "mate fails when its window is gone or it never reached its charter"
 
-# worker: it must have declared its gate wait.
+# The current-state reader, not an old event, establishes the gate wait.
+GATE="$CH/data/$WORKER_ID/gate"
+assert_contains "$(sed -n 's/^gate=//p' "$C/.fm-live-lab")" "$CH/data/$WORKER_ID/" "operator can find the gate in the worker's task directory"
 : > "$CH/state/$WORKER_ID.status"
 run_check "$C"
-assert_contains "$CHECK_OUT" "fail worker: the worker has not declared its gate wait yet" "worker needs its paused line"
-printf 'paused [at=1]: waiting on gate file %s to exist\n' "$C/gates/$WORKER_ID" > "$CH/state/$WORKER_ID.status"
-pass "worker fails until the worker parks on its gate"
+assert_contains "$CHECK_OUT" "fail worker: the worker is not currently parked" "worker needs a current pause"
+printf 'paused [at=1]: waiting on gate file %s to exist\n' "$GATE" > "$CH/state/$WORKER_ID.status"
+printf 'working [at=2]: resumed\n' >> "$CH/state/$WORKER_ID.status"
+run_check "$C"
+assert_contains "$CHECK_OUT" "fail worker: the worker is not currently parked" "stale paused event cannot pass readiness"
+printf 'paused [at=3]: waiting on gate file %s to exist\n' "$GATE" >> "$CH/state/$WORKER_ID.status"
+run_check "$C"
+assert_contains "$CHECK_OUT" "ok worker: $WORKER_ID parked on $GATE" "current pause passes readiness"
+pass "worker readiness follows current crew state and the recorded accessible gate"
 
 # treehouse: a worker pool must land inside the lab, never in ~/.treehouse.
 mkdir "$HOME/.treehouse/notes-leaked"
@@ -290,10 +301,17 @@ C_HASH=$(printf '%s' "$CH" | shasum -a 256 | awk '{print $1}')
 OTHER_ID="labt$$-other"
 fm_write_meta "$CH/state/$OTHER_ID.meta" "window=firstmate:fm-$OTHER_ID" "tasktmp=/tmp/fm-$OTHER_ID"
 mkdir -p "/tmp/fm-$WORKER_ID/gotmp" "/tmp/fm-$MATE_ID" "/tmp/fm-$WORKER_ID+$C_HASH" "/tmp/fm-$OTHER_ID+$C_HASH" "/tmp/fm-$OTHER_ID"
+# An outsider opening a lab path is not owned by the lab.
 printf 'sleep 600\n' > "$C/stray.sh"
 bash "$C/stray.sh" &
 STRAY=$!
+printf '%s\n' "$STRAY" >> "$TMP_ROOT/pids"
 until STRAY_CHILD=$(pgrep -P "$STRAY" sleep); do sleep 0.1; done
+printf '%s\n' "$STRAY_CHILD" >> "$TMP_ROOT/pids"
+# A launch-recorded process and its child must be stopped even when not in tmux.
+sleep 600 &
+OWNED=$!
+printf 'launch_pid=%s\n' "$OWNED" >> "$C/.fm-live-lab"
 # A sibling lab root that shares this root as a string prefix is not this lab.
 mkdir -p "${C}2"
 printf 'sleep 600\n' > "${C}2/stray.sh"
@@ -305,8 +323,9 @@ rm -f "$CH/state/$WORKER_ID.meta"
 C_TMUX=$(sed -n 's/^tmux_dir=//p' "$C/.fm-live-lab")
 out=$(HOME="$LATER_HOME" "$LIVE_LAB" down "$C" 2>&1)
 expect_code 0 "$?" "down of a clean Claude lab succeeds from a shell with another HOME: $out"
-! kill -0 "$STRAY" 2>/dev/null || fail "down stops processes that name the lab root"
-! kill -0 "$STRAY_CHILD" 2>/dev/null || fail "down stops their descendants, which need not name the root"
+kill -0 "$STRAY" 2>/dev/null || fail "down leaves unrelated processes opening the lab path alone"
+kill -0 "$STRAY_CHILD" 2>/dev/null || fail "down leaves their descendants alone"
+! kill -0 "$OWNED" 2>/dev/null || fail "down stops recorded launch processes"
 assert_absent "$C" "down removes the lab root"
 kill -0 "$SIBLING" 2>/dev/null || fail "down leaves a sibling root's process running"
 pkill -P "$SIBLING" 2>/dev/null
@@ -320,7 +339,8 @@ assert_present "/tmp/fm-$OTHER_ID" "down keeps a task temp dir another home coul
 kept=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));console.log(JSON.stringify([j.keep,Object.keys(j.projects).sort()]))' "$HOME/.claude.json")
 assert_equals '[1,["/elsewhere/project"]]' "$kept" "down removes exactly the lab's Claude project entries"
 assert_contains "$out" "removed: 2 Claude project entries" "down reports the removed entries"
-pass "down stops the lab, removes its trust entries and task temp dirs, and keeps everything else"
+kill "$STRAY" "$STRAY_CHILD" 2>/dev/null || true
+pass "down stops only recorded lab processes, removes trust entries and task temp dirs"
 
 # The Claude store up selected is the one check and down use, even from a later
 # shell with another CLAUDE_CONFIG_DIR, and a symlinked store stays a symlink.
@@ -365,6 +385,20 @@ out=$("$LIVE_LAB" up --harness codex "$TMP_ROOT/new" 2>&1)
 expect_code 1 "$?" "up refuses an unsupported harness"
 assert_absent "$TMP_ROOT/new" "a refused harness creates nothing"
 pass "up refuses an existing root and an unsupported harness"
+
+# up persists full-width, distinct task IDs even when checkout fails before
+# launching a harness; down can still clean this partial lab.
+PARTIAL="$TMP_ROOT/partial-lab"
+out=$($LIVE_LAB up --harness claude --source "$TMP_ROOT/missing-origin" "$PARTIAL" 2>&1)
+expect_code 1 "$?" "an unavailable source stops up before launch"
+assert_present "$PARTIAL/.fm-live-lab" "up recorded its selected task IDs"
+ids=$(awk -F= '/^(mate_id|worker_id)=/ {print $2}' "$PARTIAL/.fm-live-lab")
+if ! printf '%s\n' "$ids" | grep -Eq '^lab[0-9a-f]{12}-(mate|worker)$'; then fail "task IDs need twelve nonce hex digits: $ids"; fi
+assert_equals 2 "$(printf '%s\n' "$ids" | grep -Ec '^lab[0-9a-f]{12}-(mate|worker)$')" "both mate and worker use twelve nonce digits"
+out=$($LIVE_LAB down "$PARTIAL" 2>&1)
+expect_code 0 "$?" "down cleans a lab whose checkout failed: $out"
+assert_absent "$PARTIAL" "partial lab removed"
+pass "up gives both task IDs a long nonce and down cleans partial setup"
 
 # ---- fm-claude-trust.sh --lab-home -------------------------------------------
 
