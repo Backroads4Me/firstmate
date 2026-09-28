@@ -44,10 +44,11 @@ NONCE=abc12345
 
 digest() { shasum -a 256 "$1" | awk '{print $1}'; }
 
-# make_lab <name> <harness>: a lab root in the shape up builds, with a live
-# private tmux server. Every readiness input starts in its passing state.
+# make_lab <name> <harness> [<claude-config-dir>]: a lab root in the shape up
+# builds, with a live private tmux server. Every readiness input starts in its
+# passing state.
 make_lab() {
-  local root="$TMP_ROOT/$1" harness=$2 home tmux_dir lock_pid
+  local root="$TMP_ROOT/$1" harness=$2 claude_dir=${3:-} home tmux_dir lock_pid
   home="$root/home"
   mkdir -p "$root"
   "$ROOT/bin/fm-lab-home.sh" create "$home" >/dev/null || fail "lab home create"
@@ -72,6 +73,7 @@ make_lab() {
     echo "mate_id=$MATE_ID"
     echo "worker_id=$WORKER_ID"
     echo "pi_trust=$(digest "$HOME/.pi/agent/trust.json")"
+    echo "claude_config_dir=$claude_dir"
     echo "tmux_dir=$tmux_dir"
   } > "$root/.fm-live-lab"
 
@@ -93,7 +95,7 @@ make_lab() {
     '{"seq":2,"epoch":2,"key":"k","id":"b","tag":"main","text":"LABREADY"}' > "$home/state/.host-mirror.jsonl"
   write_pi_markers "$home" "$lock_pid"
   [ "$harness" = claude ] && node -e 'const fs=require("node:fs");const [s,h,r]=process.argv.slice(1);fs.writeFileSync(s,JSON.stringify({keep:1,projects:{[h]:{hasTrustDialogAccepted:true},[r+"/mate"]:{hasTrustDialogAccepted:true},"/elsewhere/project":{hasTrustDialogAccepted:true}}},null,2)+"\n")' \
-    "$HOME/.claude.json" "$home" "$root"
+    "${claude_dir:-$HOME}/.claude.json" "$home" "$root"
   printf '%s\n' "$root"
 }
 
@@ -122,7 +124,7 @@ start_watcher() {  # <home>: a live process holding a matching watcher lock
 }
 
 write_pi_markers() {  # <home> <lock-pid>
-  local home=$1 pid=$2 v
+  local home=$1 pid=$2
   v() { FM_HOME="$home" bash -c '. "$1/bin/fm-wake-lib.sh"; fm_pi_extension_version "$1/.pi/extensions/$2"' _ "$home" "$1"; }
   printf '%s\n%s\ngeneration=1 phase=active\n' "$(v fm-primary-pi-watch.ts)" "$pid" > "$home/state/.pi-watch-extension-loaded"
   printf '%s\n%s\n' "$(v fm-primary-turnend-guard.ts)" "$pid" > "$home/state/.pi-turnend-extension-loaded"
@@ -287,14 +289,25 @@ printf 'sleep 600\n' > "$C/stray.sh"
 bash "$C/stray.sh" &
 STRAY=$!
 until STRAY_CHILD=$(pgrep -P "$STRAY" sleep); do sleep 0.1; done
+# A sibling lab root that shares this root as a string prefix is not this lab.
+mkdir -p "${C}2"
+printf 'sleep 600\n' > "${C}2/stray.sh"
+bash "${C}2/stray.sh" 2>/dev/null &
+SIBLING=$!
+printf '%s\n' "$SIBLING" >> "$TMP_ROOT/pids"
+# The worker spawn failed after keeping its task temp dirs, before its meta.
+rm -f "$CH/state/$WORKER_ID.meta"
 C_TMUX=$(sed -n 's/^tmux_dir=//p' "$C/.fm-live-lab")
 out=$("$LIVE_LAB" down "$C" 2>&1)
 expect_code 0 "$?" "down of a clean Claude lab succeeds: $out"
 ! kill -0 "$STRAY" 2>/dev/null || fail "down stops processes that name the lab root"
 ! kill -0 "$STRAY_CHILD" 2>/dev/null || fail "down stops their descendants, which need not name the root"
 assert_absent "$C" "down removes the lab root"
+kill -0 "$SIBLING" 2>/dev/null || fail "down leaves a sibling root's process running"
+pkill -P "$SIBLING" 2>/dev/null
+kill "$SIBLING" 2>/dev/null
 assert_absent "$C_TMUX" "down removes the private tmux directory"
-assert_absent "/tmp/fm-$WORKER_ID" "down removes the worker's task temp dir"
+assert_absent "/tmp/fm-$WORKER_ID" "down removes the worker's task temp dir, even without its meta"
 assert_absent "/tmp/fm-$MATE_ID" "down removes the mate's task temp dir"
 assert_absent "/tmp/fm-$WORKER_ID+$C_HASH" "down removes the worker's launch dir"
 assert_absent "/tmp/fm-$OTHER_ID+$C_HASH" "down removes a lab-spawned task's launch dir scoped to the lab home"
@@ -303,6 +316,25 @@ kept=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[
 assert_equals '[1,["/elsewhere/project"]]' "$kept" "down removes exactly the lab's Claude project entries"
 assert_contains "$out" "removed: 2 Claude project entries" "down reports the removed entries"
 pass "down stops the lab, removes its trust entries and task temp dirs, and keeps everything else"
+
+# The Claude store up selected is the one check and down use, even from a later
+# shell with another CLAUDE_CONFIG_DIR, and a symlinked store stays a symlink.
+SC="$TMP_ROOT/claude-config"
+mkdir -p "$SC"
+S=$(make_lab s claude "$SC")
+mv "$SC/.claude.json" "$TMP_ROOT/claude-store-target.json"
+ln -s "$TMP_ROOT/claude-store-target.json" "$SC/.claude.json"
+HOME_STORE_BEFORE=$(digest "$HOME/.claude.json")
+CHECK_OUT=$(CLAUDE_CONFIG_DIR="$TMP_ROOT/other-config" "$LIVE_LAB" check "$S" 2>&1)
+assert_contains "$CHECK_OUT" "ok trust: $S/home is trusted in the Claude store" "check reads the recorded store"
+out=$(CLAUDE_CONFIG_DIR="$TMP_ROOT/other-config" "$LIVE_LAB" down "$S" 2>&1)
+expect_code 0 "$?" "down of a lab on a configured store succeeds: $out"
+assert_contains "$out" "removed: 2 Claude project entries" "down removes the entries from the recorded store"
+[ -L "$SC/.claude.json" ] || fail "down keeps a symlinked Claude store a symlink"
+kept=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));console.log(JSON.stringify([j.keep,Object.keys(j.projects).sort()]))' "$TMP_ROOT/claude-store-target.json")
+assert_equals '[1,["/elsewhere/project"]]' "$kept" "down rewrites the symlink's target"
+assert_equals "$HOME_STORE_BEFORE" "$(digest "$HOME/.claude.json")" "down leaves the default store alone"
+pass "check and down use the recorded Claude store and keep a symlinked store linked"
 
 printf '{"trusted":["/somewhere"]}\n' > "$HOME/.pi/agent/trust.json"
 run_check "$P"

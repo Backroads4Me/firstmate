@@ -8,8 +8,8 @@
 #   fm-live-lab.sh up --harness claude|pi [--mate] [--worker]
 #                     [--model <m>] [--effort <e>]
 #                     [--supervision-host <line>|none] [--expect-host yes|no]
-#                     [--source <repo>] [--ref <rev>] [--env NAME=VALUE]...
-#                     [--timeout <seconds>] [<lab-root>]
+#                     [--source <repo>] [--ref <rev>] [--timeout <seconds>]
+#                     [<lab-root>]
 #   fm-live-lab.sh check <lab-root>
 #   fm-live-lab.sh say <lab-root> [--window <name>] <text>
 #   fm-live-lab.sh pane <lab-root> [--window <name>] [--lines <n>]
@@ -44,6 +44,9 @@
 #                    never lands in ~/.treehouse, and DISABLE_AUTOUPDATER=1
 #                    keeps Claude Code from replacing the shared binary under
 #                    a running lab, as every live run does (tests/lib.sh).
+#                    A set CLAUDE_CONFIG_DIR (absolute) is recorded at up and
+#                    passed to every lab process, so up, check, and down all
+#                    use that one Claude store, even from a later shell.
 #   trust            Claude: bin/fm-claude-trust.sh --lab-home for the primary
 #                    (the workspace-trust prompt wedged the first lab), and the
 #                    spawn's own registration for the mate and worker. Pi:
@@ -95,11 +98,13 @@
 #   treehouse     ~/.treehouse gained no entry since up began.
 #
 # down refuses any path without the lab record up writes. It kills only the
-# lab's private tmux server, the processes whose command line names <lab-root>,
-# and their descendants; runs bin/fm-lab-home.sh teardown; removes the task
-# temp and launch dirs the lab's spawns kept under /tmp; removes every
-# ~/.claude.json project entry at or under <lab-root> (compare-and-swap atomic
-# replace, unrelated entries kept); reports a changed Pi trust store or a new
+# lab's private tmux server, the processes whose command line names <lab-root>
+# as a whole path (never a sibling such as <lab-root>2), and their descendants;
+# runs bin/fm-lab-home.sh teardown; removes the task temp and launch dirs the
+# lab's spawns kept under /tmp, including a failed spawn's; removes every
+# project entry at or under <lab-root> from the recorded Claude store, following
+# a symlinked store to its target (compare-and-swap atomic replace, unrelated
+# entries kept); reports a changed Pi trust store or a new
 # ~/.treehouse entry without touching either; and removes <lab-root>.
 # Transcripts under ~/.claude/projects are left as history. The lab never uses
 # Herdr.
@@ -148,7 +153,10 @@ load_lab() {  # <root>: refuse anything up did not build, then load its record
   MATE_ID=$(rec_get "$ROOT" mate_id)
   WORKER_ID=$(rec_get "$ROOT" worker_id)
   PI_TRUST_BEFORE=$(rec_get "$ROOT" pi_trust)
+  CLAUDE_DIR=$(rec_get "$ROOT" claude_config_dir)
 }
+
+claude_store() { echo "${CLAUDE_DIR:-$HOME}/.claude.json"; }
 
 lab_tmux() {
   [ -n "${TMUX_DIR:-}" ] || return 1
@@ -160,6 +168,7 @@ lab_env_base() {
   printf '%s\n' "HOME=$HOME" "USER=${USER:-$(id -un)}" "LOGNAME=${USER:-$(id -un)}" \
     "PATH=$PATH" "SHELL=${SHELL:-/bin/zsh}" "TERM=xterm-256color" "LANG=${LANG:-en_US.UTF-8}" \
     "TMUX_TMPDIR=$TMUX_DIR" "TREEHOUSE_ROOT=$ROOT/treehouse" "FM_BACKEND=tmux" "DISABLE_AUTOUPDATER=1"
+  [ -z "${CLAUDE_DIR:-}" ] || printf '%s\n' "CLAUDE_CONFIG_DIR=$CLAUDE_DIR"
 }
 
 lab_run() {  # [NAME=VALUE...] <command...>: run in the lab's clean environment
@@ -235,7 +244,7 @@ check_trust() {
     return 0
   fi
   if node -e 'const [s,k]=process.argv.slice(1);const j=JSON.parse(require("node:fs").readFileSync(s,"utf8"));process.exit(j.projects?.[k]?.hasTrustDialogAccepted===true?0:1)' \
-    "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json" "$LAB" 2>/dev/null; then
+    "$(claude_store)" "$LAB" 2>/dev/null; then
     echo "ok trust: $LAB is trusted in the Claude store"
   else
     echo "fail trust: $LAB has no registered Claude workspace trust"
@@ -431,7 +440,6 @@ spawn_mate() {
 
 cmd_up() {
   local harness="" mate=no worker=no model="" effort=medium host_line=__default__ expect_host="" source="$BUILDER_ROOT" ref=HEAD timeout=600
-  local -a extra_env=()
   local root=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -444,7 +452,6 @@ cmd_up() {
       --expect-host) expect_host=${2:-}; shift 2 ;;
       --source) source=${2:-}; shift 2 ;;
       --ref) ref=${2:-}; shift 2 ;;
-      --env) case "${2:-}" in [A-Za-z_]*=*) extra_env+=("$2") ;; *) die "--env takes NAME=VALUE" ;; esac; shift 2 ;;
       --timeout) timeout=${2:-}; shift 2 ;;
       -h|--help) help_text; exit 0 ;;
       -*) die "unknown option '$1'" ;;
@@ -457,6 +464,8 @@ cmd_up() {
   case "$expect_host" in yes|no) ;; *) die "--expect-host takes yes or no" ;; esac
   [ "$host_line" != __default__ ] || { [ "$harness" = claude ] && host_line=claude || host_line=none; }
   [ -n "$model" ] || { [ "$harness" = claude ] && model=sonnet || model=openai-codex/gpt-6-luna; }
+  CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-}
+  case "$CLAUDE_DIR" in ''|/*) ;; *) die "CLAUDE_CONFIG_DIR must be an absolute path" ;; esac
   for tool in git tmux jq node python3 shasum "$harness"; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required and was not found on PATH"
   done
@@ -485,6 +494,7 @@ cmd_up() {
     echo "mate_id=$MATE_ID"
     echo "worker_id=$WORKER_ID"
     echo "pi_trust=$PI_TRUST_BEFORE"
+    echo "claude_config_dir=$CLAUDE_DIR"
   } > "$ROOT/$RECORD_NAME"
   echo "lab: $ROOT (tear down with: $0 down $ROOT)"
 
@@ -516,7 +526,7 @@ cmd_up() {
     primary=(pi --approve --session-dir "$ROOT/pi-sessions" --model "$model" --thinking "$effort")
   fi
   lab_tmux new-window -d -t firstmate: -n main -c "$LAB" \
-    env FM_HOME="$LAB" CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false ${extra_env[@]+"${extra_env[@]}"} "${primary[@]}" \
+    env FM_HOME="$LAB" CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false "${primary[@]}" \
     || die "cannot launch the lab primary"
   lab_tmux set-option -w -t "$(window_id main)" remain-on-exit on >/dev/null
   echo "primary: ${primary[*]}"
@@ -541,11 +551,21 @@ cmd_up() {
 
 # ---- down -------------------------------------------------------------------
 
-# lab_pids: processes whose command line names the lab root, and every
-# descendant of one (a child such as an engine turn need not name the root),
-# never this script's own ancestry or descendants.
+# lab_pids: processes whose command line names the lab root as a whole path
+# (the root itself or a path under it, never a sibling that merely shares its
+# prefix), and every descendant of one (a child such as an engine turn need not
+# name the root), never this script's own ancestry or descendants.
 lab_pids() {
-  ps -axo pid=,ppid=,command= | awk -v self=$$ -v a="$ROOT" -v b="${ROOT#/private}" '
+  ps -axo pid=,ppid=,command= | awk -v self=$$ -v a="$ROOT" -v b="${ROOT#/private}" -v lead=" =:\"'" -v trail="/ :\"'" '
+    function names(s, r,   start, i, pre, post) {
+      for (start = 1; (i = index(substr(s, start), r)) > 0; start = i + 1) {
+        i += start - 1
+        pre = i > 1 ? substr(s, i - 1, 1) : ""
+        post = substr(s, i + length(r), 1)
+        if ((pre == "" || index(lead, pre)) && (post == "" || index(trail, post))) return 1
+      }
+      return 0
+    }
     { pid[NR]=$1; ppid[$1]=$2; line=$0; sub(/^ *[0-9]+ +[0-9]+ /, "", line); cmd[$1]=line }
     END {
       for (p = self; p > 1 && (p in ppid); p = ppid[p]) own[p] = 1
@@ -557,7 +577,7 @@ lab_pids() {
       for (i = 1; i <= NR; i++) {
         p = pid[i]
         if (p in own) continue
-        if (index(cmd[p], a) || index(cmd[p], b)) named[p] = 1
+        if (names(cmd[p], a) || names(cmd[p], b)) named[p] = 1
       }
       for (i = 1; i <= NR; i++) {
         p = pid[i]
@@ -568,13 +588,19 @@ lab_pids() {
 }
 
 forget_claude_entries() {  # remove every project entry at or under ROOT; prints the count
-  local store="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
-  [ -f "$store" ] || { echo 0; return 0; }
+  local store
+  store=$(claude_store)
+  [ -e "$store" ] || { echo 0; return 0; }
   node - "$store" "$ROOT" "${ROOT#/private}" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const [store, ...roots] = process.argv.slice(2);
+const [link, ...roots] = process.argv.slice(2);
+const store = fs.realpathSync(link);
+const stat = fs.statSync(store);
+if (!stat.isFile() || stat.uid !== process.getuid()) {
+  console.error(`error: ${store} is not a regular file this user owns`); process.exit(1);
+}
 const inLab = (key) => roots.some((r) => key === r || key.startsWith(`${r}/`));
 const fingerprint = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -614,6 +640,7 @@ NODE
 cmd_down() {
   load_lab "${1:-}"
   local rc=0 pids n=0 removed added id meta dir home_hash
+  local -a ids=()
   lab_tmux kill-server 2>/dev/null || true
   while pids=$(lab_pids) && [ -n "$pids" ] && [ "$n" -lt 20 ]; do
     # shellcheck disable=SC2086 # One pid per word.
@@ -627,9 +654,12 @@ cmd_down() {
   # The second is scoped to this lab home for any task it spawned; the first is
   # removed only for the lab's own unique ids, since another home may share it.
   home_hash=$(printf '%s' "$LAB" | shasum -a 256 | awk '{print $1}')
+  ids=("$MATE_ID" "$WORKER_ID")
   for meta in "$LAB"/state/*.meta; do
-    [ -f "$meta" ] || continue
-    id=$(basename "$meta" .meta)
+    [ -f "$meta" ] && ids+=("$(basename "$meta" .meta)")
+  done
+  for id in "${ids[@]}"; do
+    [ -n "$id" ] || continue
     for dir in "/tmp/fm-$id+$home_hash" "/tmp/fm-$id"; do
       [ "$dir" != "/tmp/fm-$id" ] || [ "$id" = "$MATE_ID" ] || [ "$id" = "$WORKER_ID" ] || continue
       if [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; then
