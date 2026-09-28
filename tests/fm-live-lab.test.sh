@@ -82,7 +82,7 @@ make_lab() {
   } > "$root/.fm-live-lab"
 
   lab_tmux "$root" new-session -d -s firstmate -n lab -c "$root" 'exec sleep 600'
-  printf 'launch_pid=%s\n' "$(lab_tmux "$root" display-message -p '#{pid}')" >> "$root/.fm-live-lab"
+  record_pid "$root" "$(lab_tmux "$root" display-message -p '#{pid}')"
   lab_tmux "$root" new-window -d -t firstmate: -n main -c "$home" "printf 'LABREADY-$NONCE\n'; exec sleep 600"
   lab_tmux "$root" new-window -d -t firstmate: -n "fm-$MATE_ID" -c "$root/mate" 'exec sleep 600'
   lab_tmux "$root" new-window -d -t firstmate: -n "fm-$WORKER_ID" -c "$root" 'exec sleep 600'
@@ -103,6 +103,10 @@ make_lab() {
   [ "$harness" = claude ] && node -e 'const fs=require("node:fs");const [s,h,r]=process.argv.slice(1);fs.writeFileSync(s,JSON.stringify({keep:1,projects:{[h]:{hasTrustDialogAccepted:true},[r+"/mate"]:{hasTrustDialogAccepted:true},"/elsewhere/project":{hasTrustDialogAccepted:true}}},null,2)+"\n")' \
     "${claude_dir:-$HOME}/.claude.json" "$home" "$root"
   printf '%s\n' "$root"
+}
+
+record_pid() {  # <root> <pid>
+  printf 'launch_pid=%s\nlaunch_start=%s\n' "$2" "$(ps -o lstart= -p "$2" | awk '{$1=$1; print}')" >> "$1/.fm-live-lab"
 }
 
 lab_tmux() {  # <root> <tmux args...>
@@ -311,7 +315,7 @@ printf '%s\n' "$STRAY_CHILD" >> "$TMP_ROOT/pids"
 # A launch-recorded process and its child must be stopped even when not in tmux.
 sleep 600 &
 OWNED=$!
-printf 'launch_pid=%s\n' "$OWNED" >> "$C/.fm-live-lab"
+record_pid "$C" "$OWNED"
 # A sibling lab root that shares this root as a string prefix is not this lab.
 mkdir -p "${C}2"
 printf 'sleep 600\n' > "${C}2/stray.sh"
@@ -361,6 +365,45 @@ assert_equals '[1,["/elsewhere/project"]]' "$kept" "down rewrites the symlink's 
 assert_equals "$HOME_STORE_BEFORE" "$(digest "$HOME/.claude.json")" "down leaves the default store alone"
 pass "check and down use the recorded Claude store and keep a symlinked store linked"
 
+# TERM handlers may write trust again, and an uncooperative lab process must
+# be killed before the store or lab directory is removed.
+X=$(make_lab x claude)
+cat > "$TMP_ROOT/exit-rewriter.sh" <<'SH'
+store=$1 key=$2 marker=$3
+trap 'sleep 1; node -e "const fs=require(\"node:fs\");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,\"utf8\"));j.projects[k]={hasTrustDialogAccepted:true};fs.writeFileSync(s,JSON.stringify(j))" "$store" "$key"; echo rewrote > "$marker"; exit 0' TERM
+while :; do sleep 0.1; done
+SH
+bash "$TMP_ROOT/exit-rewriter.sh" "$HOME/.claude.json" "$X/home" "$TMP_ROOT/rewrote" &
+REWRITER=$!
+bash -c 'trap "" TERM; while :; do sleep 0.1; done' &
+STUBBORN=$!
+sleep 0.2
+printf '%s\n%s\n' "$REWRITER" "$STUBBORN" >> "$TMP_ROOT/pids"
+record_pid "$X" "$REWRITER"
+record_pid "$X" "$STUBBORN"
+out=$("$LIVE_LAB" down "$X" 2>&1)
+expect_code 0 "$?" "down waits for lab processes: $out"
+wait "$REWRITER" 2>/dev/null || true
+assert_equals rewrote "$(cat "$TMP_ROOT/rewrote" 2>/dev/null)" "TERM handler rewrote its Claude key before down returned"
+! kill -0 "$STUBBORN" 2>/dev/null || fail "down must kill a TERM-resistant lab process"
+sleep 1.5
+lab_keys=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));console.log(Object.keys(j.projects).filter(k=>k.startsWith(process.argv[2])).join(" "))' "$HOME/.claude.json" "$X")
+assert_equals "" "$lab_keys" "no exiting lab process re-adds Claude trust"
+pass "down waits for TERM handlers and escalates before removing trust"
+
+# A reused PID with a different start time must not own its new process tree.
+Y=$(make_lab y claude)
+bash -c 'sleep 600 & echo $! > "$1"; wait' _ "$TMP_ROOT/reused-child" & REUSED=$!
+until [ -s "$TMP_ROOT/reused-child" ]; do sleep 0.1; done
+REUSED_CHILD=$(cat "$TMP_ROOT/reused-child")
+printf '%s\n%s\n' "$REUSED" "$REUSED_CHILD" >> "$TMP_ROOT/pids"
+printf 'launch_pid=%s\nlaunch_start=Mon Jan  1 00:00:00 1990\n' "$REUSED" >> "$Y/.fm-live-lab"
+out=$("$LIVE_LAB" down "$Y" 2>&1)
+expect_code 0 "$?" "down skips the mismatched root: $out"
+kill -0 "$REUSED" 2>/dev/null || fail "down killed a reused PID"
+kill -0 "$REUSED_CHILD" 2>/dev/null || fail "down killed the reused PID's child"
+pass "down ignores roots with mismatched start times"
+
 printf '{"trusted":["/somewhere"]}\n' > "$HOME/.pi/agent/trust.json"
 run_check "$P"
 assert_contains "$CHECK_OUT" "fail trust: the Pi trust store changed since up began" "a written Pi trust store is caught"
@@ -402,6 +445,52 @@ out=$($LIVE_LAB down "$PARTIAL" 2>&1)
 expect_code 0 "$?" "down cleans a lab whose checkout failed: $out"
 assert_absent "$PARTIAL" "partial lab removed"
 pass "up gives both task IDs a long nonce and down cleans partial setup"
+
+# A rival Claude writer drops the newly registered primary key once. The
+# stand-in primary checks the store on startup, while the readiness probe fails.
+UPSRC="$TMP_ROOT/up-source"
+mkdir -p "$UPSRC"
+cp -R "$ROOT/bin" "$UPSRC/bin"
+cp "$ROOT/AGENTS.md" "$UPSRC/AGENTS.md"
+git -C "$UPSRC" init -q -b main
+git -C "$UPSRC" add -A
+git -C "$UPSRC" -c user.name=t -c user.email=t@example.invalid commit -qm source
+FAKEBIN="$TMP_ROOT/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/claude" <<'SH'
+#!/usr/bin/env bash
+sleep 1.5
+if node -e 'const [s,k]=process.argv.slice(1);const j=JSON.parse(require("node:fs").readFileSync(s,"utf8"));process.exit(j.projects?.[k]?.hasTrustDialogAccepted===true?0:1)' "$HOME/.claude.json" "$FM_HOME"; then
+  echo present > "$FM_HOME/../claude-launch-trust"
+else
+  echo absent > "$FM_HOME/../claude-launch-trust"
+fi
+: > "$FM_HOME/state/.session-start-complete"
+exec sleep 600
+SH
+chmod +x "$FAKEBIN/claude"
+U="$TMP_ROOT/up-lab"
+(
+  end=$(( $(date +%s) + 120 ))
+  until node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));process.exit(j.projects?.[process.argv[2]]?1:0)' "$HOME/.claude.json" "$U/home" 2>/dev/null; do
+    [ "$(date +%s)" -lt "$end" ] || exit 1
+    sleep 0.05
+  done
+  sleep 0.5
+  node -e 'const fs=require("node:fs");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,"utf8"));delete j.projects[k];fs.writeFileSync(s,JSON.stringify(j))' "$HOME/.claude.json" "$U/home"
+  echo dropped > "$TMP_ROOT/rival-dropped"
+) &
+RIVAL=$!
+printf '%s\n' "$RIVAL" >> "$TMP_ROOT/pids"
+out=$(PATH="$FAKEBIN:$PATH" "$LIVE_LAB" up --harness claude --source "$UPSRC" --ref HEAD --timeout 1 "$U" 2>&1)
+expect_code 1 "$?" "stand-in primary does not answer probe"
+wait "$RIVAL" 2>/dev/null || true
+assert_equals dropped "$(cat "$TMP_ROOT/rival-dropped" 2>/dev/null)" "rival dropped primary trust once"
+assert_equals present "$(cat "$U/claude-launch-trust" 2>/dev/null)" "primary launched trusted after the rival write"
+assert_contains "$out" "ok trust: $U/home is trusted in the Claude store" "readiness sees primary trust"
+out=$("$LIVE_LAB" down "$U" 2>&1)
+expect_code 0 "$?" "down removes the up-built lab: $out"
+pass "up re-registers primary trust after a concurrent Claude write"
 
 # ---- fm-claude-trust.sh --lab-home -------------------------------------------
 

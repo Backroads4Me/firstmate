@@ -231,6 +231,11 @@ check_probe() {
   fi
 }
 
+lab_trust_present() {
+  node -e 'const [s,k]=process.argv.slice(1);const j=JSON.parse(require("node:fs").readFileSync(s,"utf8"));process.exit(j.projects?.[k]?.hasTrustDialogAccepted===true?0:1)' \
+    "$CLAUDE_STORE" "$LAB" 2>/dev/null
+}
+
 check_trust() {
   if [ "$HARNESS" = pi ]; then
     [ "$(digest "$PI_TRUST_STORE")" = "$PI_TRUST_BEFORE" ] \
@@ -238,8 +243,7 @@ check_trust() {
     echo "ok trust: Pi trust store unchanged (session-only --approve)"
     return 0
   fi
-  if node -e 'const [s,k]=process.argv.slice(1);const j=JSON.parse(require("node:fs").readFileSync(s,"utf8"));process.exit(j.projects?.[k]?.hasTrustDialogAccepted===true?0:1)' \
-    "$CLAUDE_STORE" "$LAB" 2>/dev/null; then
+  if lab_trust_present; then
     echo "ok trust: $LAB is trusted in the Claude store"
   else
     echo "fail trust: $LAB has no registered Claude workspace trust"
@@ -518,21 +522,31 @@ cmd_up() {
   TMUX_DIR=$("$LAB_HOME_HELPER" tmux-dir "$LAB") || die "cannot create the private tmux directory"
   echo "tmux_dir=$TMUX_DIR" >> "$ROOT/$RECORD_NAME"
   lab_run tmux -f /dev/null new-session -d -s firstmate -n lab -x 220 -y 60 -c "$ROOT" || die "cannot start the lab tmux server"
-  echo "launch_pid=$(lab_tmux display-message -p '#{pid}')" >> "$ROOT/$RECORD_NAME"
+  record_launch_pid "$(lab_tmux display-message -p '#{pid}')"
 
   if [ "$mate" = yes ]; then
     spawn_mate || die "cannot seed and launch the second mate"
-    echo "launch_pid=$(window_field mate '#{pane_pid}')" >> "$ROOT/$RECORD_NAME"
+    record_launch_pid "$(window_field mate '#{pane_pid}')"
   fi
   if [ "$worker" = yes ]; then
     spawn_worker || die "cannot launch the gated worker"
-    echo "launch_pid=$(window_field worker '#{pane_pid}')" >> "$ROOT/$RECORD_NAME"
+    record_launch_pid "$(window_field worker '#{pane_pid}')"
     echo "gate: $GATE (touch to release the worker)"
   fi
 
   local -a primary=()
   if [ "$harness" = claude ]; then
-    lab_run "$CLAUDE_TRUST" --lab-home "$LAB" >/dev/null || die "cannot register Claude trust for the lab home"
+    local settle=$(( $(date +%s) + 300 )) attempt
+    until { [ "$mate" != yes ] || check_mate >/dev/null; } && { [ "$worker" != yes ] || check_worker >/dev/null; }; do
+      [ "$(date +%s)" -lt "$settle" ] || die "mate or worker did not become ready before Claude primary trust registration"
+      sleep 2
+    done
+    for attempt in 1 2 3; do
+      lab_run "$CLAUDE_TRUST" --lab-home "$LAB" >/dev/null || die "cannot register Claude trust for the lab home"
+      sleep 1
+      lab_trust_present && break
+    done
+    lab_trust_present || die "the lab home's Claude trust keeps disappearing from $CLAUDE_STORE"
     primary=(claude --setting-sources "project,local" --model "$model" --effort "$effort" --permission-mode auto)
   else
     primary=(pi --approve --session-dir "$ROOT/pi-sessions" --model "$model" --thinking "$effort")
@@ -541,7 +555,7 @@ cmd_up() {
     env FM_HOME="$LAB" CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false "${primary[@]}" \
     || die "cannot launch the lab primary"
   lab_tmux set-option -w -t "$(window_id main)" remain-on-exit on >/dev/null
-  echo "launch_pid=$(window_field main '#{pane_pid}')" >> "$ROOT/$RECORD_NAME"
+  record_launch_pid "$(window_field main '#{pane_pid}')"
   echo "primary: ${primary[*]}"
 
   local deadline=$(( $(date +%s) + 180 ))
@@ -564,17 +578,31 @@ cmd_up() {
 
 # ---- down -------------------------------------------------------------------
 
-# lab_pids: only recorded launch PIDs and their descendants. Resolve the tree
-# before killing tmux, while pane children still have their original parents.
+record_launch_pid() {
+  local start
+  start=$(ps -o lstart= -p "$1" | awk '{$1=$1; print}')
+  [ -n "$start" ] || die "cannot record start time for lab process $1"
+  printf 'launch_pid=%s\nlaunch_start=%s\n' "$1" "$start" >> "$ROOT/$RECORD_NAME"
+}
+
+# Resolve recorded roots only while their start times match, before tmux
+# reparents their descendants.
 lab_pids() {
-  ps -axo pid=,ppid= | awk -v record="$ROOT/$RECORD_NAME" '
+  ps -axo pid=,ppid=,lstart= | awk -v record="$ROOT/$RECORD_NAME" '
     BEGIN {
       while ((getline line < record) > 0) {
-        if (line ~ /^launch_pid=[0-9]+$/) { sub(/^launch_pid=/, "", line); roots[line] = 1 }
+        if (line ~ /^launch_pid=[0-9]+$/) { sub(/^launch_pid=/, "", line); root=line }
+        else if (line ~ /^launch_start=/ && root != "") {
+          sub(/^launch_start=/, "", line); starts[root]=line; root=""
+        }
       }
       close(record)
     }
-    { pid[NR]=$1; ppid[$1]=$2 }
+    {
+      pid[NR]=$1; ppid[$1]=$2
+      start=$3 " " $4 " " $5 " " $6 " " $7
+      if ($1 in starts && start == starts[$1]) roots[$1]=1
+    }
     END {
       for (i = 1; i <= NR; i++) {
         p = pid[i]
@@ -583,6 +611,14 @@ lab_pids() {
         }
       }
     }'
+}
+
+live_pids() {
+  local pid state
+  for pid in $1; do
+    state=$(ps -o stat= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')
+    case "$state" in ''|Z*) ;; *) echo "$pid" ;; esac
+  done
 }
 
 forget_claude_entries() {  # remove every project entry at or under ROOT; prints the count
@@ -635,7 +671,7 @@ NODE
 
 cmd_down() {
   load_lab "${1:-}"
-  local rc=0 pids removed added id meta dir home_hash
+  local rc=0 pids survivors n removed added id meta dir home_hash
   local -a ids=()
   pids=$(lab_pids)
   lab_tmux kill-server 2>/dev/null || true
@@ -643,6 +679,17 @@ cmd_down() {
     # shellcheck disable=SC2086 # One pid per word, captured before tmux reparents panes.
     kill $pids 2>/dev/null || true
   fi
+  for n in {1..40}; do
+    survivors=$(live_pids "$pids $(lab_pids)")
+    [ -n "$survivors" ] || break
+    if [ "$n" -eq 20 ]; then
+      # shellcheck disable=SC2086 # One pid per word.
+      kill -9 $survivors 2>/dev/null || true
+    fi
+    sleep 0.5
+  done
+  survivors=$(live_pids "$pids $(lab_pids)")
+  [ -z "$survivors" ] || die "refusing to remove the lab: its processes did not exit: $(echo "$survivors" | tr '\n' ' ')"
   echo "stopped: lab tmux server and lab processes"
   # A spawn keeps /tmp/fm-<id> and /tmp/fm-<id>+<sha256 of the spawning home>.
   # The second is scoped to this lab home for any task it spawned; the first is
