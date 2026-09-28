@@ -389,7 +389,10 @@ pass "up refuses an existing root and an unsupported harness"
 # up persists full-width, distinct task IDs even when checkout fails before
 # launching a harness; down can still clean this partial lab.
 PARTIAL="$TMP_ROOT/partial-lab"
-out=$($LIVE_LAB up --harness claude --source "$TMP_ROOT/missing-origin" "$PARTIAL" 2>&1)
+mkdir -p "$TMP_ROOT/stub-bin"
+printf '#!/bin/sh\nexit 99\n' > "$TMP_ROOT/stub-bin/claude"
+chmod +x "$TMP_ROOT/stub-bin/claude"
+out=$(PATH="$TMP_ROOT/stub-bin:$PATH" "$LIVE_LAB" up --harness claude --source "$TMP_ROOT/missing-origin" "$PARTIAL" 2>&1)
 expect_code 1 "$?" "an unavailable source stops up before launch"
 assert_present "$PARTIAL/.fm-live-lab" "up recorded its selected task IDs"
 ids=$(awk -F= '/^(mate_id|worker_id)=/ {print $2}' "$PARTIAL/.fm-live-lab")
