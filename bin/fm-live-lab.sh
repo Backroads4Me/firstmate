@@ -462,6 +462,7 @@ cmd_up() {
   CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-}
   case "$CLAUDE_DIR" in ''|/*) ;; *) die "CLAUDE_CONFIG_DIR must be an absolute path" ;; esac
   CLAUDE_STORE="${CLAUDE_DIR:-$HOME}/.claude.json"
+  [ -z "$root" ] || [ ! -e "$root" ] || die "refusing '$root': a lab root must not exist yet"
   for tool in git tmux jq node python3 shasum "$harness"; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required and was not found on PATH"
   done
@@ -469,7 +470,6 @@ cmd_up() {
   if [ -z "$root" ]; then
     root=$(mktemp -d /tmp/fmlab.XXXXXX) || die "cannot create a lab root"
   else
-    [ ! -e "$root" ] || die "refusing '$root': a lab root must not exist yet"
     mkdir -p "$root" || die "cannot create '$root'"
   fi
   ROOT=$(real_dir "$root")
