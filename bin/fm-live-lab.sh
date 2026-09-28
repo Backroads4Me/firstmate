@@ -91,14 +91,15 @@
 #   worker        --worker: the worker declared its gate wait in its status.
 #   treehouse     ~/.treehouse gained no entry since up began.
 #
-# down refuses any path without the lab record up writes, kills only the lab's
-# private tmux server and processes whose command line names <lab-root>, runs
-# bin/fm-lab-home.sh teardown, removes the lab tasks' /tmp/fm-<id> task temp
-# dirs, removes every ~/.claude.json project entry at or
-# under <lab-root> (compare-and-swap atomic replace, unrelated entries kept),
-# reports a changed Pi trust store or new ~/.treehouse entry without touching
-# either, and removes <lab-root>. Transcripts under ~/.claude/projects are left
-# as history. The lab never uses Herdr.
+# down refuses any path without the lab record up writes. It kills only the
+# lab's private tmux server, the processes whose command line names <lab-root>,
+# and their descendants; runs bin/fm-lab-home.sh teardown; removes the task
+# temp and launch dirs the lab's spawns kept under /tmp; removes every
+# ~/.claude.json project entry at or under <lab-root> (compare-and-swap atomic
+# replace, unrelated entries kept); reports a changed Pi trust store or a new
+# ~/.treehouse entry without touching either; and removes <lab-root>.
+# Transcripts under ~/.claude/projects are left as history. The lab never uses
+# Herdr.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -165,22 +166,32 @@ lab_run() {  # [NAME=VALUE...] <command...>: run in the lab's clean environment
   env -i "${base[@]}" "$@"
 }
 
-# window_target <name>: an exact tmux target, because tmux resolves a name it
-# cannot find to the current window. mate and worker name the lab's own tasks,
-# whose windows the spawn recorded in their metadata.
-window_target() {
+# window_id <name>: the tmux id of the lab window with exactly this name, or
+# nothing. A name is matched here and never passed as a target, because tmux
+# resolves a target it cannot find, even an exact =name, to the current window,
+# while a stale window id fails. mate and worker name the lab's own tasks, whose
+# windows the spawn recorded in their metadata.
+window_id() {
   local name=$1 window
   case "$name" in
     mate) name=$MATE_ID ;;
     worker) name=$WORKER_ID ;;
   esac
   window=$(sed -n 's/^window=//p' "$LAB/state/$name.meta" 2>/dev/null)
-  [ -n "$window" ] || window="firstmate:$name"
-  printf '%s:=%s\n' "${window%%:*}" "${window#*:}"
+  [ -z "$window" ] || name=${window#*:}
+  lab_tmux list-windows -t firstmate -F "#{window_name}$(printf '\t')#{window_id}" 2>/dev/null \
+    | awk -F '\t' -v n="$name" '$1 == n { print $2; exit }'
+}
+
+window_field() {  # <name> <format>
+  local id
+  id=$(window_id "$1")
+  [ -n "$id" ] || return 1
+  lab_tmux display-message -p -t "$id" "$2" 2>/dev/null
 }
 
 window_alive() {  # <name>
-  [ "$(lab_tmux display-message -p -t "$(window_target "$1")" '#{pane_dead}' 2>/dev/null)" = 0 ]
+  [ "$(window_field "$1" '#{pane_dead}')" = 0 ]
 }
 
 pid_alive() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; kill -0 "$1" 2>/dev/null; }
@@ -192,7 +203,7 @@ fleet_nonempty() { [ "$WANT_MATE" = yes ] || [ "$WANT_WORKER" = yes ]; }
 check_primary() {
   local path gitdir common pid
   window_alive main || { echo "fail primary: window main is not running"; return 1; }
-  path=$(lab_tmux display-message -p -t firstmate:=main '#{pane_current_path}' 2>/dev/null)
+  path=$(window_field main '#{pane_current_path}')
   [ "$(real_dir "$path")" = "$LAB" ] || { echo "fail primary: window main runs in '$path', not the lab home $LAB"; return 1; }
   gitdir=$(real_dir "$(git -C "$LAB" rev-parse --absolute-git-dir 2>/dev/null)")
   common=$(cd "$LAB" && real_dir "$(git rev-parse --git-common-dir 2>/dev/null)")
@@ -203,7 +214,9 @@ check_primary() {
 }
 
 check_probe() {
-  if lab_tmux capture-pane -p -J -t firstmate:=main -S -5000 2>/dev/null | grep -Fq "LABREADY-$NONCE"; then
+  local id
+  id=$(window_id main)
+  if [ -n "$id" ] && lab_tmux capture-pane -p -J -t "$id" -S -5000 2>/dev/null | grep -Fq "LABREADY-$NONCE"; then
     echo "ok probe: the primary answered LABREADY-$NONCE"
   else
     echo "fail probe: no LABREADY-$NONCE reply in window main (model refused, turn still running, or a dialog is open)"
@@ -328,11 +341,12 @@ run_checks() {
 # ---- up ---------------------------------------------------------------------
 
 say_text() {  # <window> <text>
-  local target
-  target=$(window_target "$1")
-  lab_tmux send-keys -t "$target" -l "$2" || return 1
+  local id
+  id=$(window_id "$1")
+  [ -n "$id" ] || { echo "fm-live-lab: no lab window named '$1'" >&2; return 1; }
+  lab_tmux send-keys -t "$id" -l "$2" || return 1
   sleep 1
-  lab_tmux send-keys -t "$target" Enter
+  lab_tmux send-keys -t "$id" Enter
 }
 
 make_notes_project() {
@@ -501,7 +515,7 @@ cmd_up() {
   lab_tmux new-window -d -t firstmate: -n main -c "$LAB" \
     env FM_HOME="$LAB" CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false ${extra_env[@]+"${extra_env[@]}"} "${primary[@]}" \
     || die "cannot launch the lab primary"
-  lab_tmux set-option -w -t firstmate:main remain-on-exit on >/dev/null
+  lab_tmux set-option -w -t "$(window_id main)" remain-on-exit on >/dev/null
   echo "primary: ${primary[*]}"
 
   local deadline=$(( $(date +%s) + 180 ))
@@ -524,17 +538,28 @@ cmd_up() {
 
 # ---- down -------------------------------------------------------------------
 
-lab_pids() {  # processes whose command line names the lab root, never this script's own tree
+# lab_pids: processes whose command line names the lab root, and every
+# descendant of one (a child such as an engine turn need not name the root),
+# never this script's own ancestry or descendants.
+lab_pids() {
   ps -axo pid=,ppid=,command= | awk -v self=$$ -v a="$ROOT" -v b="${ROOT#/private}" '
     { pid[NR]=$1; ppid[$1]=$2; line=$0; sub(/^ *[0-9]+ +[0-9]+ /, "", line); cmd[$1]=line }
     END {
       for (p = self; p > 1 && (p in ppid); p = ppid[p]) own[p] = 1
       for (i = 1; i <= NR; i++) {
         p = pid[i]
-        if (p in own) continue
         for (q = ppid[p]; q > 1 && (q in ppid); q = ppid[q]) if (q == self) break
-        if (q == self) continue
-        if (index(cmd[p], a) || index(cmd[p], b)) print p
+        if (q == self) own[p] = 1
+      }
+      for (i = 1; i <= NR; i++) {
+        p = pid[i]
+        if (p in own) continue
+        if (index(cmd[p], a) || index(cmd[p], b)) named[p] = 1
+      }
+      for (i = 1; i <= NR; i++) {
+        p = pid[i]
+        if (p in own) continue
+        for (q = p; q > 1 && (q in ppid); q = ppid[q]) if (q in named) { print p; break }
       }
     }'
 }
@@ -585,7 +610,7 @@ NODE
 
 cmd_down() {
   load_lab "${1:-}"
-  local rc=0 pids n=0 removed added id tasktmp
+  local rc=0 pids n=0 removed added id meta dir home_hash
   lab_tmux kill-server 2>/dev/null || true
   while pids=$(lab_pids) && [ -n "$pids" ] && [ "$n" -lt 20 ]; do
     # shellcheck disable=SC2086 # One pid per word.
@@ -595,11 +620,19 @@ cmd_down() {
   pids=$(lab_pids)
   [ -z "$pids" ] || die "refusing to remove the lab: processes still name it: $(printf '%s' "$pids" | tr '\n' ' ')"
   echo "stopped: lab tmux server and lab processes"
-  for id in "$MATE_ID" "$WORKER_ID"; do
-    tasktmp=$(sed -n 's/^tasktmp=//p' "$LAB/state/$id.meta" 2>/dev/null)
-    if [ -n "$id" ] && [ "$tasktmp" = "/tmp/fm-$id" ] && [ -d "$tasktmp" ] && [ ! -L "$tasktmp" ] && [ -O "$tasktmp" ]; then
-      rm -rf "$tasktmp" && echo "removed: task temp $tasktmp"
-    fi
+  # A spawn keeps /tmp/fm-<id> and /tmp/fm-<id>+<sha256 of the spawning home>.
+  # The second is scoped to this lab home for any task it spawned; the first is
+  # removed only for the lab's own unique ids, since another home may share it.
+  home_hash=$(printf '%s' "$LAB" | shasum -a 256 | awk '{print $1}')
+  for meta in "$LAB"/state/*.meta; do
+    [ -f "$meta" ] || continue
+    id=$(basename "$meta" .meta)
+    for dir in "/tmp/fm-$id+$home_hash" "/tmp/fm-$id"; do
+      [ "$dir" != "/tmp/fm-$id" ] || [ "$id" = "$MATE_ID" ] || [ "$id" = "$WORKER_ID" ] || continue
+      if [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; then
+        rm -rf "$dir" && echo "removed: task temp $dir"
+      fi
+    done
   done
   if [ -f "$LAB/.fm-lab-home" ]; then
     "$LAB_HOME_HELPER" teardown "$LAB" || die "cannot remove the private tmux directory"
@@ -642,7 +675,10 @@ cmd_pane() {
       *) usage ;;
     esac
   done
-  lab_tmux capture-pane -p -J -t "firstmate:$window" -S "-$lines" | grep -v '^[[:space:]]*$'
+  local id
+  id=$(window_id "$window")
+  [ -n "$id" ] || die "no lab window named '$window'"
+  lab_tmux capture-pane -p -J -t "$id" -S "-$lines" | grep -v '^[[:space:]]*$'
 }
 
 cmd_check() {
