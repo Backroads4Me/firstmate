@@ -40,7 +40,9 @@
 #                    TMUX, Herdr, or Pi marker reaches a lab process (a probe
 #                    that inherited the caller's Pi marker was discarded).
 #                    TREEHOUSE_ROOT points into <lab-root>, so a worker's pool
-#                    never lands in ~/.treehouse.
+#                    never lands in ~/.treehouse, and DISABLE_AUTOUPDATER=1
+#                    keeps Claude Code from replacing the shared binary under
+#                    a running lab, as every live run does (tests/lib.sh).
 #   trust            Claude: bin/fm-claude-trust.sh --lab-home for the primary
 #                    (the workspace-trust prompt wedged the first lab), and the
 #                    spawn's own registration for the mate and worker. Pi:
@@ -156,7 +158,7 @@ lab_tmux() {
 lab_env_base() {
   printf '%s\n' "HOME=$HOME" "USER=${USER:-$(id -un)}" "LOGNAME=${USER:-$(id -un)}" \
     "PATH=$PATH" "SHELL=${SHELL:-/bin/zsh}" "TERM=xterm-256color" "LANG=${LANG:-en_US.UTF-8}" \
-    "TMUX_TMPDIR=$TMUX_DIR" "TREEHOUSE_ROOT=$ROOT/treehouse" "FM_BACKEND=tmux"
+    "TMUX_TMPDIR=$TMUX_DIR" "TREEHOUSE_ROOT=$ROOT/treehouse" "FM_BACKEND=tmux" "DISABLE_AUTOUPDATER=1"
 }
 
 lab_run() {  # [NAME=VALUE...] <command...>: run in the lab's clean environment
