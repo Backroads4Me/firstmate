@@ -36,7 +36,8 @@
 #                    supervision-host <line> (default claude on Claude, absent
 #                    on Pi; none leaves the file absent).
 #   tmux server      private, through the lab home's bin/fm-lab-home.sh
-#                    tmux-dir, started from an empty environment so no inherited
+#                    tmux-dir, with no user tmux config (its plugins never run
+#                    in a lab), started from an empty environment so no inherited
 #                    TMUX, Herdr, or Pi marker reaches a lab process (a probe
 #                    that inherited the caller's Pi marker was discarded).
 #                    TREEHOUSE_ROOT points into <lab-root>, so a worker's pool
@@ -502,7 +503,7 @@ cmd_up() {
 
   TMUX_DIR=$("$LAB_HOME_HELPER" tmux-dir "$LAB") || die "cannot create the private tmux directory"
   echo "tmux_dir=$TMUX_DIR" >> "$ROOT/$RECORD_NAME"
-  lab_run tmux new-session -d -s firstmate -n lab -x 220 -y 60 -c "$ROOT" || die "cannot start the lab tmux server"
+  lab_run tmux -f /dev/null new-session -d -s firstmate -n lab -x 220 -y 60 -c "$ROOT" || die "cannot start the lab tmux server"
 
   if [ "$mate" = yes ]; then spawn_mate || die "cannot seed and launch the second mate"; fi
   if [ "$worker" = yes ]; then spawn_worker || die "cannot launch the gated worker"; fi

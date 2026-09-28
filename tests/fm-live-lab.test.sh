@@ -60,7 +60,7 @@ make_lab() {
   git -C "$home" -c user.name=t -c user.email=t@example.invalid commit -qm lab
   tmux_dir=$("$ROOT/bin/fm-lab-home.sh" tmux-dir "$home") || fail "lab tmux dir"
   printf '%s\n' "$tmux_dir" >> "$TMP_ROOT/tmux-dirs"
-  ls -1A "$HOME/.treehouse" | sort > "$root/.treehouse-before"
+  find "$HOME/.treehouse" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort > "$root/.treehouse-before"
   {
     echo 'fm-live-lab v1'
     echo "harness=$harness"
