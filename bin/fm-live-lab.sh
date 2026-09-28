@@ -44,9 +44,10 @@
 #                    never lands in ~/.treehouse, and DISABLE_AUTOUPDATER=1
 #                    keeps Claude Code from replacing the shared binary under
 #                    a running lab, as every live run does (tests/lib.sh).
-#                    A set CLAUDE_CONFIG_DIR (absolute) is recorded at up and
-#                    passed to every lab process, so up, check, and down all
-#                    use that one Claude store, even from a later shell.
+#                    A set CLAUDE_CONFIG_DIR (absolute) is passed to every lab
+#                    process. up records the Claude store, Pi trust store, and
+#                    ~/.treehouse it selected, so check and down use those same
+#                    paths even from a later shell with another HOME.
 #   trust            Claude: bin/fm-claude-trust.sh --lab-home for the primary
 #                    (the workspace-trust prompt wedged the first lab), and the
 #                    spawn's own registration for the mate and worker. Pi:
@@ -154,9 +155,10 @@ load_lab() {  # <root>: refuse anything up did not build, then load its record
   WORKER_ID=$(rec_get "$ROOT" worker_id)
   PI_TRUST_BEFORE=$(rec_get "$ROOT" pi_trust)
   CLAUDE_DIR=$(rec_get "$ROOT" claude_config_dir)
+  CLAUDE_STORE=$(rec_get "$ROOT" claude_store)
+  PI_TRUST_STORE=$(rec_get "$ROOT" pi_trust_store)
+  TREEHOUSE_DIR=$(rec_get "$ROOT" treehouse_dir)
 }
-
-claude_store() { echo "${CLAUDE_DIR:-$HOME}/.claude.json"; }
 
 lab_tmux() {
   [ -n "${TMUX_DIR:-}" ] || return 1
@@ -244,7 +246,7 @@ check_trust() {
     return 0
   fi
   if node -e 'const [s,k]=process.argv.slice(1);const j=JSON.parse(require("node:fs").readFileSync(s,"utf8"));process.exit(j.projects?.[k]?.hasTrustDialogAccepted===true?0:1)' \
-    "$(claude_store)" "$LAB" 2>/dev/null; then
+    "$CLAUDE_STORE" "$LAB" 2>/dev/null; then
     echo "ok trust: $LAB is trusted in the Claude store"
   else
     echo "fail trust: $LAB has no registered Claude workspace trust"
@@ -466,6 +468,7 @@ cmd_up() {
   [ -n "$model" ] || { [ "$harness" = claude ] && model=sonnet || model=openai-codex/gpt-6-luna; }
   CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-}
   case "$CLAUDE_DIR" in ''|/*) ;; *) die "CLAUDE_CONFIG_DIR must be an absolute path" ;; esac
+  CLAUDE_STORE="${CLAUDE_DIR:-$HOME}/.claude.json"
   for tool in git tmux jq node python3 shasum "$harness"; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required and was not found on PATH"
   done
@@ -495,6 +498,9 @@ cmd_up() {
     echo "worker_id=$WORKER_ID"
     echo "pi_trust=$PI_TRUST_BEFORE"
     echo "claude_config_dir=$CLAUDE_DIR"
+    echo "claude_store=$CLAUDE_STORE"
+    echo "pi_trust_store=$PI_TRUST_STORE"
+    echo "treehouse_dir=$TREEHOUSE_DIR"
   } > "$ROOT/$RECORD_NAME"
   echo "lab: $ROOT (tear down with: $0 down $ROOT)"
 
@@ -588,10 +594,8 @@ lab_pids() {
 }
 
 forget_claude_entries() {  # remove every project entry at or under ROOT; prints the count
-  local store
-  store=$(claude_store)
-  [ -e "$store" ] || { echo 0; return 0; }
-  node - "$store" "$ROOT" "${ROOT#/private}" <<'NODE'
+  [ -e "$CLAUDE_STORE" ] || { echo 0; return 0; }
+  node - "$CLAUDE_STORE" "$ROOT" "${ROOT#/private}" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");

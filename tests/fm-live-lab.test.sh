@@ -74,6 +74,9 @@ make_lab() {
     echo "worker_id=$WORKER_ID"
     echo "pi_trust=$(digest "$HOME/.pi/agent/trust.json")"
     echo "claude_config_dir=$claude_dir"
+    echo "claude_store=${claude_dir:-$HOME}/.claude.json"
+    echo "pi_trust_store=$HOME/.pi/agent/trust.json"
+    echo "treehouse_dir=$HOME/.treehouse"
     echo "tmux_dir=$tmux_dir"
   } > "$root/.fm-live-lab"
 
@@ -249,8 +252,10 @@ mkdir "$HOME/.treehouse/notes-leaked"
 run_check "$C"
 assert_contains "$CHECK_OUT" "fail treehouse: new ~/.treehouse entries: notes-leaked" "treehouse names the leaked pool"
 rmdir "$HOME/.treehouse/notes-leaked"
-run_check "$C"
-expect_code 0 "$CHECK_RC" "the Claude lab is ready again after every restore: $CHECK_OUT"
+LATER_HOME="$TMP_ROOT/later-home"
+mkdir -p "$LATER_HOME"
+CHECK_OUT=$(HOME="$LATER_HOME" "$LIVE_LAB" check "$C" 2>&1)
+expect_code 0 "$?" "the Claude lab is ready again after every restore, even from a shell with another HOME: $CHECK_OUT"
 pass "treehouse fails when a pool lands in ~/.treehouse"
 
 # ---- Pi lab: extensions and the session-only trust store -------------------
@@ -298,8 +303,8 @@ printf '%s\n' "$SIBLING" >> "$TMP_ROOT/pids"
 # The worker spawn failed after keeping its task temp dirs, before its meta.
 rm -f "$CH/state/$WORKER_ID.meta"
 C_TMUX=$(sed -n 's/^tmux_dir=//p' "$C/.fm-live-lab")
-out=$("$LIVE_LAB" down "$C" 2>&1)
-expect_code 0 "$?" "down of a clean Claude lab succeeds: $out"
+out=$(HOME="$LATER_HOME" "$LIVE_LAB" down "$C" 2>&1)
+expect_code 0 "$?" "down of a clean Claude lab succeeds from a shell with another HOME: $out"
 ! kill -0 "$STRAY" 2>/dev/null || fail "down stops processes that name the lab root"
 ! kill -0 "$STRAY_CHILD" 2>/dev/null || fail "down stops their descendants, which need not name the root"
 assert_absent "$C" "down removes the lab root"
