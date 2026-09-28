@@ -20,7 +20,7 @@
 # It exits 0 only when every check passed; otherwise it exits 1 and leaves the
 # lab up for inspection, so run down either way. check re-runs the same checks
 # once. say types text into a lab window and presses Enter (window main, the
-# lab primary, by default; mate and lab-worker are the other windows). pane
+# lab primary, by default; mate and worker name the lab's own tasks). pane
 # prints a window's recent scrollback. down stops every lab process, removes the
 # lab's Claude trust entries by one atomic replace, removes <lab-root>, and exits
 # non-zero if anything outside the lab changed.
@@ -48,13 +48,16 @@
 #                    only, so the Pi trust store is never written and all of
 #                    .pi/extensions loads (one Pi lab lacked the branch
 #                    extension); sessions stay under <lab-root>/pi-sessions.
-#   mate/            --mate: bin/fm-home-seed.sh mate <lab-root>/mate
+#   task ids         lab<nonce>-mate and lab<nonce>-worker, unique per lab,
+#                    because a spawn keeps a task temp dir at /tmp/fm-<id>
+#                    that a fixed id would share with other labs and tasks.
+#   mate/            --mate: bin/fm-home-seed.sh <mate-id> <lab-root>/mate
 #                    --no-projects (an explicit path cloned from the git lab
 #                    home), launched by bin/fm-spawn.sh --secondmate.
-#   lab-worker       --worker: a lab project notes with a lab-private origin
+#   worker           --worker: a lab project notes with a lab-private origin
 #                    (local-only +yolo), a scaffolded brief, a backlog item, and
 #                    a real bin/fm-spawn.sh worker that parks on
-#                    <lab-root>/gates/lab-worker until that file exists; touch
+#                    <lab-root>/gates/<worker-id> until that file exists; touch
 #                    it to let the worker finish.
 #   primary          window main: claude --setting-sources project,local
 #                    (default sonnet, medium, permission mode auto) or pi
@@ -90,7 +93,8 @@
 #
 # down refuses any path without the lab record up writes, kills only the lab's
 # private tmux server and processes whose command line names <lab-root>, runs
-# bin/fm-lab-home.sh teardown, removes every ~/.claude.json project entry at or
+# bin/fm-lab-home.sh teardown, removes the lab tasks' /tmp/fm-<id> task temp
+# dirs, removes every ~/.claude.json project entry at or
 # under <lab-root> (compare-and-swap atomic replace, unrelated entries kept),
 # reports a changed Pi trust store or new ~/.treehouse entry without touching
 # either, and removes <lab-root>. Transcripts under ~/.claude/projects are left
@@ -137,6 +141,8 @@ load_lab() {  # <root>: refuse anything up did not build, then load its record
   WANT_MATE=$(rec_get "$ROOT" mate)
   WANT_WORKER=$(rec_get "$ROOT" worker)
   NONCE=$(rec_get "$ROOT" nonce)
+  MATE_ID=$(rec_get "$ROOT" mate_id)
+  WORKER_ID=$(rec_get "$ROOT" worker_id)
   PI_TRUST_BEFORE=$(rec_get "$ROOT" pi_trust)
 }
 
@@ -159,8 +165,22 @@ lab_run() {  # [NAME=VALUE...] <command...>: run in the lab's clean environment
   env -i "${base[@]}" "$@"
 }
 
-window_alive() {  # <window>
-  [ "$(lab_tmux display-message -p -t "firstmate:$1" '#{pane_dead}' 2>/dev/null)" = 0 ]
+# window_target <name>: an exact tmux target, because tmux resolves a name it
+# cannot find to the current window. mate and worker name the lab's own tasks,
+# whose windows the spawn recorded in their metadata.
+window_target() {
+  local name=$1 window
+  case "$name" in
+    mate) name=$MATE_ID ;;
+    worker) name=$WORKER_ID ;;
+  esac
+  window=$(sed -n 's/^window=//p' "$LAB/state/$name.meta" 2>/dev/null)
+  [ -n "$window" ] || window="firstmate:$name"
+  printf '%s:=%s\n' "${window%%:*}" "${window#*:}"
+}
+
+window_alive() {  # <name>
+  [ "$(lab_tmux display-message -p -t "$(window_target "$1")" '#{pane_dead}' 2>/dev/null)" = 0 ]
 }
 
 pid_alive() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; kill -0 "$1" 2>/dev/null; }
@@ -172,7 +192,7 @@ fleet_nonempty() { [ "$WANT_MATE" = yes ] || [ "$WANT_WORKER" = yes ]; }
 check_primary() {
   local path gitdir common pid
   window_alive main || { echo "fail primary: window main is not running"; return 1; }
-  path=$(lab_tmux display-message -p -t firstmate:main '#{pane_current_path}' 2>/dev/null)
+  path=$(lab_tmux display-message -p -t firstmate:=main '#{pane_current_path}' 2>/dev/null)
   [ "$(real_dir "$path")" = "$LAB" ] || { echo "fail primary: window main runs in '$path', not the lab home $LAB"; return 1; }
   gitdir=$(real_dir "$(git -C "$LAB" rev-parse --absolute-git-dir 2>/dev/null)")
   common=$(cd "$LAB" && real_dir "$(git rev-parse --git-common-dir 2>/dev/null)")
@@ -183,7 +203,7 @@ check_primary() {
 }
 
 check_probe() {
-  if lab_tmux capture-pane -p -J -t firstmate:main -S -5000 2>/dev/null | grep -Fq "LABREADY-$NONCE"; then
+  if lab_tmux capture-pane -p -J -t firstmate:=main -S -5000 2>/dev/null | grep -Fq "LABREADY-$NONCE"; then
     echo "ok probe: the primary answered LABREADY-$NONCE"
   else
     echo "fail probe: no LABREADY-$NONCE reply in window main (model refused, turn still running, or a dialog is open)"
@@ -267,17 +287,17 @@ check_watcher() {
 
 check_mate() {
   local pid
-  window_alive mate || { echo "fail mate: window mate is not running"; return 1; }
+  window_alive mate || { echo "fail mate: the $MATE_ID window is not running"; return 1; }
   pid=$(sed -n 1p "$ROOT/mate/state/.lock" 2>/dev/null)
   pid_alive "$pid" || { echo "fail mate: the mate holds no session lock yet (wedged before its charter?)"; return 1; }
-  echo "ok mate: second mate pid $pid in $ROOT/mate"
+  echo "ok mate: $MATE_ID pid $pid in $ROOT/mate"
 }
 
 check_worker() {
-  window_alive lab-worker || { echo "fail worker: window lab-worker is not running"; return 1; }
-  grep -E '^paused' "$LAB/state/lab-worker.status" 2>/dev/null | grep -Fq "$ROOT/gates/lab-worker" \
+  window_alive worker || { echo "fail worker: the $WORKER_ID window is not running"; return 1; }
+  grep -E '^paused' "$LAB/state/$WORKER_ID.status" 2>/dev/null | grep -Fq "$ROOT/gates/$WORKER_ID" \
     || { echo "fail worker: the worker has not declared its gate wait yet"; return 1; }
-  echo "ok worker: parked on $ROOT/gates/lab-worker"
+  echo "ok worker: $WORKER_ID parked on $ROOT/gates/$WORKER_ID"
 }
 
 check_treehouse() {
@@ -308,9 +328,11 @@ run_checks() {
 # ---- up ---------------------------------------------------------------------
 
 say_text() {  # <window> <text>
-  lab_tmux send-keys -t "firstmate:$1" -l "$2" || return 1
+  local target
+  target=$(window_target "$1")
+  lab_tmux send-keys -t "$target" -l "$2" || return 1
   sleep 1
-  lab_tmux send-keys -t "firstmate:$1" Enter
+  lab_tmux send-keys -t "$target" Enter
 }
 
 make_notes_project() {
@@ -364,10 +386,10 @@ MD
 }
 
 spawn_worker() {
-  local brief="$LAB/data/lab-worker/brief.md" gate="$ROOT/gates/lab-worker"
+  local brief="$LAB/data/$WORKER_ID/brief.md" gate="$ROOT/gates/$WORKER_ID"
   mkdir -p "$ROOT/gates"
   make_notes_project || return 1
-  (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-brief.sh" lab-worker notes --mode local-only) >/dev/null || return 1
+  (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-brief.sh" "$WORKER_ID" notes --mode local-only) >/dev/null || return 1
   TASK_TEXT="Lab gated worker for a live supervision lab. Add count_notes(), which returns how many notes are stored, to notes/__init__.py with a unit test, but only after the gate file $gate exists." \
   SPEC_TEXT="Right after setup, append one paused status line that names the gate file $gate, then check for that file every 15 seconds and do nothing else until it exists. Then implement count_notes() in notes/__init__.py and a test in tests/test_notes.py, run python3 -m unittest discover -s tests, commit, and report done. Nothing else is in scope." \
     python3 - "$brief" <<'PY' || return 1
@@ -377,8 +399,8 @@ text = open(path, encoding="utf-8").read()
 text = text.replace("{TASK}", os.environ["TASK_TEXT"], 1).replace("{FIRSTMATE_SPEC}", os.environ["SPEC_TEXT"], 1)
 open(path, "w", encoding="utf-8").write(text)
 PY
-  (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-tasks-axi.sh" add lab-worker "lab gated worker" --kind ship --repo notes) >/dev/null || return 1
-  (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-spawn.sh" lab-worker "$LAB/projects/notes" \
+  (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-tasks-axi.sh" add "$WORKER_ID" "lab gated worker" --kind ship --repo notes) >/dev/null || return 1
+  (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-spawn.sh" "$WORKER_ID" "$LAB/projects/notes" \
     --mode local-only --yolo on --harness claude --model sonnet --effort low)
 }
 
@@ -386,8 +408,8 @@ spawn_mate() {
   local charter='Provide an idle live-validation lab second mate. When explicitly steered for a synthetic test, report only honest local lab outcomes; do not claim external PR activity, merge, or retire yourself.'
   (cd "$LAB" && lab_run FM_HOME="$LAB" FM_SECONDMATE_CHARTER="$charter" \
     FM_SECONDMATE_SCOPE='second-mate live validation synthetic status relay' \
-    "$LAB/bin/fm-home-seed.sh" mate "$ROOT/mate" --no-projects) || return 1
-  (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-spawn.sh" mate --secondmate)
+    "$LAB/bin/fm-home-seed.sh" "$MATE_ID" "$ROOT/mate" --no-projects) || return 1
+  (cd "$LAB" && lab_run FM_HOME="$LAB" "$LAB/bin/fm-spawn.sh" "$MATE_ID" --secondmate)
 }
 
 cmd_up() {
@@ -432,6 +454,7 @@ cmd_up() {
   LAB="$ROOT/home"
   HARNESS=$harness EXPECT_HOST=$expect_host WANT_MATE=$mate WANT_WORKER=$worker
   NONCE=$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')
+  MATE_ID="lab${NONCE:0:6}-mate" WORKER_ID="lab${NONCE:0:6}-worker"
   PI_TRUST_BEFORE=$(digest "$PI_TRUST_STORE")
   treehouse_listing | sort > "$ROOT/.treehouse-before"
   {
@@ -442,6 +465,8 @@ cmd_up() {
     echo "mate=$mate"
     echo "worker=$worker"
     echo "nonce=$NONCE"
+    echo "mate_id=$MATE_ID"
+    echo "worker_id=$WORKER_ID"
     echo "pi_trust=$PI_TRUST_BEFORE"
   } > "$ROOT/$RECORD_NAME"
   echo "lab: $ROOT (tear down with: $0 down $ROOT)"
@@ -499,22 +524,19 @@ cmd_up() {
 
 # ---- down -------------------------------------------------------------------
 
-ancestors() {
-  local pid=$$
-  while pid_alive "$pid" && [ "$pid" -gt 1 ]; do
-    echo "$pid"
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-  done
-}
-
-lab_pids() {  # processes whose command line names the lab root, never this one's ancestry
-  local mine
-  mine=" $(ancestors | tr '\n' ' ') "
-  ps -axo pid=,command= | while read -r pid cmd; do
-    case "$cmd" in *"$ROOT"*|*"${ROOT#/private}"*) ;; *) continue ;; esac
-    case "$mine" in *" $pid "*) continue ;; esac
-    echo "$pid"
-  done
+lab_pids() {  # processes whose command line names the lab root, never this script's own tree
+  ps -axo pid=,ppid=,command= | awk -v self=$$ -v a="$ROOT" -v b="${ROOT#/private}" '
+    { pid[NR]=$1; ppid[$1]=$2; line=$0; sub(/^ *[0-9]+ +[0-9]+ /, "", line); cmd[$1]=line }
+    END {
+      for (p = self; p > 1 && (p in ppid); p = ppid[p]) own[p] = 1
+      for (i = 1; i <= NR; i++) {
+        p = pid[i]
+        if (p in own) continue
+        for (q = ppid[p]; q > 1 && (q in ppid); q = ppid[q]) if (q == self) break
+        if (q == self) continue
+        if (index(cmd[p], a) || index(cmd[p], b)) print p
+      }
+    }'
 }
 
 forget_claude_entries() {  # remove every project entry at or under ROOT; prints the count
@@ -563,7 +585,7 @@ NODE
 
 cmd_down() {
   load_lab "${1:-}"
-  local rc=0 pids n=0 removed added
+  local rc=0 pids n=0 removed added id tasktmp
   lab_tmux kill-server 2>/dev/null || true
   while pids=$(lab_pids) && [ -n "$pids" ] && [ "$n" -lt 20 ]; do
     # shellcheck disable=SC2086 # One pid per word.
@@ -573,6 +595,12 @@ cmd_down() {
   pids=$(lab_pids)
   [ -z "$pids" ] || die "refusing to remove the lab: processes still name it: $(printf '%s' "$pids" | tr '\n' ' ')"
   echo "stopped: lab tmux server and lab processes"
+  for id in "$MATE_ID" "$WORKER_ID"; do
+    tasktmp=$(sed -n 's/^tasktmp=//p' "$LAB/state/$id.meta" 2>/dev/null)
+    if [ -n "$id" ] && [ "$tasktmp" = "/tmp/fm-$id" ] && [ -d "$tasktmp" ] && [ ! -L "$tasktmp" ] && [ -O "$tasktmp" ]; then
+      rm -rf "$tasktmp" && echo "removed: task temp $tasktmp"
+    fi
+  done
   if [ -f "$LAB/.fm-lab-home" ]; then
     "$LAB_HOME_HELPER" teardown "$LAB" || die "cannot remove the private tmux directory"
   fi
