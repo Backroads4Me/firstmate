@@ -580,6 +580,7 @@ cmd_up() {
 
 record_launch_pid() {
   local start
+  case "${1:-}" in ''|*[!0-9]*) die "cannot record lab process: missing or invalid PID '${1:-}'" ;; esac
   start=$(ps -o lstart= -p "$1" | awk '{$1=$1; print}')
   [ -n "$start" ] || die "cannot record start time for lab process $1"
   printf 'launch_pid=%s\nlaunch_start=%s\n' "$1" "$start" >> "$ROOT/$RECORD_NAME"
@@ -613,12 +614,18 @@ lab_pids() {
     }'
 }
 
+# <pid TAB lstart> pairs captured before tmux shutdown. Recheck identity even
+# after a root exits and its children are reparented or a PID is reused.
 live_pids() {
-  local pid state
-  for pid in $1; do
-    state=$(ps -o stat= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')
-    case "$state" in ''|Z*) ;; *) echo "$pid" ;; esac
-  done
+  local pid start current
+  while IFS=$'\t' read -r pid start; do
+    [ -n "$pid" ] || continue
+    current=$(ps -o stat=,lstart= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')
+    case "$current" in ''|Z*) ;; *)
+      [ "${current#* }" = "$start" ] && echo "$pid"
+      ;;
+    esac
+  done <<< "$1"
 }
 
 forget_claude_entries() {  # remove every project entry at or under ROOT; prints the count
@@ -671,16 +678,22 @@ NODE
 
 cmd_down() {
   load_lab "${1:-}"
-  local rc=0 pids survivors n removed added id meta dir home_hash
+  local rc=0 pids pairs pid start survivors n removed added id meta dir home_hash
   local -a ids=()
   pids=$(lab_pids)
+  pairs=
+  for pid in $pids; do
+    start=$(ps -o lstart= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')
+    [ -n "$start" ] && pairs+="$pid"$'\t'"$start"$'\n'
+  done
   lab_tmux kill-server 2>/dev/null || true
-  if [ -n "$pids" ]; then
-    # shellcheck disable=SC2086 # One pid per word, captured before tmux reparents panes.
-    kill $pids 2>/dev/null || true
+  survivors=$(live_pids "$pairs")
+  if [ -n "$survivors" ]; then
+    # shellcheck disable=SC2086 # One identity-checked pid per word.
+    kill $survivors 2>/dev/null || true
   fi
   for n in {1..40}; do
-    survivors=$(live_pids "$(lab_pids)")
+    survivors=$(live_pids "$pairs")
     [ -n "$survivors" ] || break
     if [ "$n" -eq 20 ]; then
       # shellcheck disable=SC2086 # One pid per word.
@@ -688,7 +701,7 @@ cmd_down() {
     fi
     sleep 0.5
   done
-  survivors=$(live_pids "$(lab_pids)")
+  survivors=$(live_pids "$pairs")
   [ -z "$survivors" ] || die "refusing to remove the lab: its processes did not exit: $(echo "$survivors" | tr '\n' ' ')"
   echo "stopped: lab tmux server and lab processes"
   # A spawn keeps /tmp/fm-<id> and /tmp/fm-<id>+<sha256 of the spawning home>.

@@ -391,6 +391,28 @@ lab_keys=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.a
 assert_equals "" "$lab_keys" "no exiting lab process re-adds Claude trust"
 pass "down waits for TERM handlers and escalates before removing trust"
 
+# A pane root may exit on TERM while its child remains alive, reparented and
+# still able to write Claude trust. Teardown must wait for the captured child.
+ORPHAN=$(make_lab orphan claude)
+cat > "$TMP_ROOT/orphan-rewriter.sh" <<'SH'
+store=$1 key=$2 marker=$3
+trap 'sleep 1; node -e "const fs=require(\"node:fs\");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,\"utf8\"));j.projects[k]={hasTrustDialogAccepted:true};fs.writeFileSync(s,JSON.stringify(j))" "$store" "$key"; echo rewrote > "$marker"; exit 0' TERM
+while :; do sleep 0.1; done
+SH
+bash -c 'bash "$1" "$2" "$3" "$4" & echo $! > "$5"; while :; do sleep 0.1; done' _ \
+  "$TMP_ROOT/orphan-rewriter.sh" "$HOME/.claude.json" "$ORPHAN/home" "$TMP_ROOT/orphan-rewrote" "$TMP_ROOT/orphan-child" &
+ORPHAN_ROOT=$!
+until [ -s "$TMP_ROOT/orphan-child" ]; do sleep 0.1; done
+ORPHAN_CHILD=$(cat "$TMP_ROOT/orphan-child")
+printf '%s\n%s\n' "$ORPHAN_ROOT" "$ORPHAN_CHILD" >> "$TMP_ROOT/pids"
+record_pid "$ORPHAN" "$ORPHAN_ROOT"
+out=$("$LIVE_LAB" down "$ORPHAN" 2>&1)
+expect_code 0 "$?" "down waits for a reparented child: $out"
+assert_equals rewrote "$(cat "$TMP_ROOT/orphan-rewrote" 2>/dev/null)" "child finished its TERM handler before cleanup"
+lab_keys=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));console.log(Object.keys(j.projects).filter(k=>k.startsWith(process.argv[2])).join(" "))' "$HOME/.claude.json" "$ORPHAN")
+assert_equals "" "$lab_keys" "reparented child cannot re-add trust after down"
+pass "down waits for captured descendants after their root exits"
+
 # A reused PID with a different start time must not own its new process tree.
 Y=$(make_lab y claude)
 bash -c 'sleep 600 & echo $! > "$1"; wait' _ "$TMP_ROOT/reused-child" & REUSED=$!
@@ -415,11 +437,11 @@ mkdir -p "$TMP_ROOT/ps-bin"
 printf '%s\n' "$REPLACED" > "$TMP_ROOT/replaced-pid"
 cat > "$TMP_ROOT/ps-bin/ps" <<'SH'
 #!/usr/bin/env bash
-if [ "${1:-}" = -axo ]; then
+if [ "${1:-}" = -o ] && [ "${2:-}" = 'stat=,lstart=' ] && [ "${4:-}" = "$(cat "$PS_TARGET")" ]; then
   count=$(cat "$PS_COUNT" 2>/dev/null || echo 0)
   echo "$((count + 1))" > "$PS_COUNT"
   if [ "$count" -gt 0 ]; then
-    "$REAL_PS" "$@" | awk -v target="$(cat "$PS_TARGET")" '$1 == target {$3="Mon"; $4="Jan"; $5="1"; $6="00:00:00"; $7="1990"} {print}'
+    echo 'S Mon Jan 1 00:00:00 1990'
   else
     "$REAL_PS" "$@"
   fi
@@ -504,7 +526,14 @@ SH
 cat > "$WORKSRC/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
 id=$1
-tmux new-window -d -t firstmate: -n "fm-$id" -c "$FM_HOME" 'exec sleep 600'
+tmux new-window -d -t firstmate: -n "fm-$id" -c "$FM_HOME" 'exec sleep 600' || exit 1
+# Wait for tmux to publish the real pane PID before the builder records it.
+for (( n=0; n<30; n++ )); do
+  pid=$(tmux display-message -p -t "firstmate:=fm-$id" '#{pane_pid}')
+  [ -z "$pid" ] || break
+  sleep 0.1
+done
+[ -n "$pid" ] || exit 1
 printf 'window=firstmate:fm-%s\n' "$id" > "$FM_HOME/state/$id.meta"
 printf 'working [at=1]: setting up\n' > "$FM_HOME/state/$id.status"
 SH
@@ -528,6 +557,25 @@ node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf
 out=$("$LIVE_LAB" down "$W" 2>&1)
 expect_code 0 "$?" "down cleans the worker lab: $out"
 pass "up launches primary after worker status without weakening final parked readiness"
+
+# If a spawn reports success without a pane, fail at the missing PID rather
+# than invoking ps with an empty -p argument or waiting for readiness.
+cat > "$WORKSRC/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+id=$1
+printf 'window=firstmate:fm-%s\n' "$id" > "$FM_HOME/state/$id.meta"
+printf 'working [at=1]: setting up\n' > "$FM_HOME/state/$id.status"
+SH
+git -C "$WORKSRC" add bin/fm-spawn.sh
+git -C "$WORKSRC" -c user.name=t -c user.email=t@example.invalid commit -qm missing-pane
+NO_PANE="$TMP_ROOT/no-pane"
+out=$(PATH="$TMP_ROOT/stub-bin:$PATH" "$LIVE_LAB" up --harness claude --worker --source "$WORKSRC" --timeout 0 "$NO_PANE" 2>&1)
+expect_code 1 "$?" "up refuses a worker without a pane PID: $out"
+assert_contains "$out" "cannot record lab process: missing or invalid PID ''" "missing pane PID fails at launch recording"
+assert_not_contains "$out" "list of process IDs must follow -p" "ps never receives an empty PID"
+out=$("$LIVE_LAB" down "$NO_PANE" 2>&1)
+expect_code 0 "$?" "down cleans the missing-pane lab: $out"
+pass "up fails immediately when a spawned worker has no pane PID"
 
 FAKEBIN="$TMP_ROOT/fakebin"
 mkdir -p "$FAKEBIN"
