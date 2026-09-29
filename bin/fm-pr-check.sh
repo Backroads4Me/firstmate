@@ -262,9 +262,16 @@ fm_pr_metadata_identity_parse "$META" || exit 1
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
 # The pull request is now recorded, so any earlier refusal naming it is spent. A
-# refusal naming a different pull request belongs to another report's verdict, so
-# the removal is scoped by the identity the record itself carries.
-fm_dod_pr_refusal_remove "$STATE" "$ID" "$URL" || true
+# record naming a different pull request belongs to another report's verdict, so the
+# clearing is scoped by the identity the record itself carries. A record this run
+# could not read or could not remove is how a refusal outlives the pull request that
+# caused it, so that is reported rather than swallowed.
+pr_check_refusal_clear=0
+fm_dod_pr_refusal_remove "$STATE" "$ID" "$URL" || pr_check_refusal_clear=$?
+if [ "$pr_check_refusal_clear" -eq 2 ]; then
+  printf 'error: %s is recorded and the refusal record for it could not be cleared: a later read will raise the lost-work alarm for a pull request that is already recorded\n' "$URL" >&2
+  exit 1
+fi
 
 PR_POLL_PUBLISH_LOCK="$STATE/.pr-poll-publish-$ID.lock"
 fm_lock_acquire_wait "$PR_POLL_PUBLISH_LOCK"

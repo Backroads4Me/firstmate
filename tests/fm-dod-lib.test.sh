@@ -501,6 +501,28 @@ test_recording_one_pull_request_leaves_another_pull_request_s_refusal_intact() {
   pass "recording one pull request leaves another pull request's refusal intact"
 }
 
+# A forge resolves an owner and repository without case, so one pull request keeps
+# one identity whichever spelling a report or a recording run arrived with.
+test_one_pull_request_keeps_one_refusal_identity_in_another_spelling() {
+  local state stored reported reason
+  state="$TMP_ROOT/spelling-state"
+  mkdir -p "$state"
+  stored=https://github.com/Owner/Repo/pull/20
+  reported=https://github.com/owner/repo/pull/20
+  fm_dod_pr_refusal_write "$state" spelled "$stored" "$stored is a draft pull request" \
+    || fail "the refusal could not be recorded under the spelling it arrived with"
+  reason=$(fm_dod_pr_refusal_reason "$state" spelled "$reported") \
+    || fail "a report in the other spelling found no refusal to read"
+  [ "$reason" = "$stored is a draft pull request" ] \
+    || fail "the refusal read in the other spelling lost its cause: $reason"
+  fm_dod_pr_refusal_remove "$state" spelled "$reported" \
+    || fail "recording the pull request in the other spelling could not clear the refusal"
+  if fm_dod_pr_refusal_reason "$state" spelled "$stored" >/dev/null; then
+    fail "the refusal outlived the record made in the other spelling"
+  fi
+  pass "one pull request keeps one refusal identity in another spelling"
+}
+
 # The wait states only what the reader can see. Nothing here measures elapsed
 # time, so a named pull request the record does not carry waits whether or not the
 # report carries a time tag, and the reason says what the record lacks instead of
@@ -720,6 +742,7 @@ test_the_wait_names_only_what_the_record_lacks
 test_a_re_recorded_refusal_keeps_only_this_runs_cause
 test_a_refusal_write_returns_the_mask_its_caller_came_in_with
 test_recording_one_pull_request_leaves_another_pull_request_s_refusal_intact
+test_one_pull_request_keeps_one_refusal_identity_in_another_spelling
 test_every_other_unreachable_claim_still_refuses
 test_fenced_and_indented_captain_lines_are_not_intent
 test_pr_based_dod_draft_check_uses_gh_axi

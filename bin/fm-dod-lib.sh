@@ -669,8 +669,12 @@ fm_dod_pr_refusal_write() {  # <state> <id> <url> <reason>
   return 0
 }
 
-# 0 when bin/fm-pr-check.sh refused exactly this pull request for this task;
-# stdout is then the one-line reason it gave.
+# What this task's record says about one pull request, read case-folded the way a
+# forge resolves it.
+# Returns 0 with the one-line reason on stdout when the record names exactly this
+# pull request; 1 when the task has no record or none a reader can resolve, which
+# alarms nobody; and 2 when a readable record names a different pull request, which
+# is that other report's verdict rather than this pull request's.
 fm_dod_pr_refusal_reason() {  # <state> <id> <url>
   local state=$1 id=$2 url=$3 marker state_device version provider host path number reason
   fm_pr_task_id_valid "$id" || return 1
@@ -691,12 +695,22 @@ fm_dod_pr_refusal_reason() {  # <state> <id> <url>
     return 1
   fi
   exec 8<&-
-  [ "$version" = fm-pr-record-refused-v1 ] \
+  # A record whose own identity fields are empty resolves to no pull request at all,
+  # so it is unreadable rather than another pull request's verdict.
+  [ -n "$provider" ] && [ -n "$host" ] && [ -n "$path" ] && [ -n "$number" ] \
+    || return 1
+  # A forge resolves an owner and repository without case, so the identity is
+  # compared case-folded: one pull request keeps one identity whichever spelling a
+  # report or a recording run arrived with.
+  if [ "$version" = fm-pr-record-refused-v1 ] \
     && [ "$provider" = "$FM_PR_PROVIDER" ] \
-    && [ "$host" = "$FM_PR_HOST" ] \
-    && [ "$path" = "$FM_PR_PATH" ] \
-    && [ "$number" = "$FM_PR_NUMBER" ] || return 1
-  printf '%s\n' "$reason"
+    && [ "${host,,}" = "${FM_PR_HOST,,}" ] \
+    && [ "${path,,}" = "${FM_PR_PATH,,}" ] \
+    && [ "$number" = "$FM_PR_NUMBER" ]; then
+    printf '%s\n' "$reason"
+    return 0
+  fi
+  return 2
 }
 
 # State what a later recording run observed about a pull request it is still
@@ -712,21 +726,29 @@ fm_dod_pr_refusal_refresh() {  # <state> <id> <url> <reason>
   fm_dod_pr_refusal_write "$state" "$id" "$url" "$reason"
 }
 
-# Drop the refusal record once a later run records the pull request that refusal
-# named, so a lane that was refused and then fixed never reads as lost work again.
-# The record names the pull request it refused, so a run that recorded a different
-# one leaves it standing: a report naming the still-unrecorded pull request has to
-# keep reading as the refusal it was given. The identity comes from the record
-# itself, since the caller cannot see which pull request a stored line names.
+# Drop the record once a later run records the pull request it named, so a lane that
+# was refused and then fixed never reads as lost work again. The record names the
+# pull request it refused, so a run that recorded a different one leaves it
+# standing: a report naming the still-unrecorded pull request has to keep reading as
+# the refusal it was given. The identity comes from the record itself, since the
+# caller cannot see which pull request a stored line names.
+# Returns 0 when nothing names this pull request any more, 1 when a readable record
+# naming a different pull request stands, and 2 when the record's place holds
+# something this run could not clear.
 fm_dod_pr_refusal_remove() {  # <state> <id> <url>
-  local state=$1 id=$2 url=$3 marker
-  fm_pr_task_id_valid "$id" || return 1
-  fm_pr_url_parse "$url" || return 1
+  local state=$1 id=$2 url=$3 marker reason_rc=0
+  fm_pr_task_id_valid "$id" || return 2
+  fm_pr_url_parse "$url" || return 2
   marker="$state/$id.pr-record-refused"
   [ -e "$marker" ] || [ -L "$marker" ] || return 0
-  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
-  fm_dod_pr_refusal_reason "$state" "$id" "$url" >/dev/null || return 1
-  rm -f -- "$marker"
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 2
+  fm_dod_pr_refusal_reason "$state" "$id" "$url" >/dev/null || reason_rc=$?
+  case "$reason_rc" in
+    0) ;;
+    2) return 1 ;;
+    *) return 2 ;;
+  esac
+  rm -f -- "$marker" || return 2
 }
 
 # 0 when <line> is not a ship done: to gate, when it names the task's recorded

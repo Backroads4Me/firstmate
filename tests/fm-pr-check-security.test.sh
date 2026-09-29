@@ -835,6 +835,31 @@ test_a_refusal_that_cannot_be_recorded_names_the_missing_record() {
   pass "a refusal that cannot be recorded names the record a later reader needs"
 }
 
+# A refusal record exists to be read back later, so a successful record that cannot
+# clear the record it spent leaves an alarm nobody can resolve. The run says so
+# rather than register the pull request beside it.
+test_a_refusal_record_that_recording_cannot_clear_is_reported() {
+  local dir refusal
+  dir=$(make_case refusal-unclearable)
+  write_task_meta "$dir"
+  FM_TEST_GH_DRAFT=true run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
+    > "$dir/stdout" 2> "$dir/stderr" && fail "a draft pull request was registered"
+  refusal="$dir/home/state/task-a.pr-record-refused"
+  [ -f "$refusal" ] || fail "the draft refusal left no record: $(cat "$dir/stderr")"
+  # The draft is resolved and the forge names the head, so this run records. The
+  # record's place is now held by a directory, so nothing can clear it.
+  rm -f -- "$refusal"
+  mkdir -p "$refusal"
+  FM_TEST_GH_DRAFT=false FM_TEST_GH_HEAD=0123456789abcdef0123456789abcdef01234567 \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
+    > "$dir/stdout" 2> "$dir/stderr" && fail "a run that cleared nothing reported success"
+  grep -Fq 'the refusal record for it could not be cleared' "$dir/stderr" \
+    || fail "a refusal record that outlived its cause was swallowed: $(cat "$dir/stderr")"
+  grep -Fq 'pr=https://github.com/o/r/pull/4' "$dir/home/state/task-a.meta" \
+    || fail "the pull request this run recorded is missing from the task's record"
+  pass "a refusal record that recording cannot clear is reported, not swallowed"
+}
+
 
 # A direct-PR worker pushes from its own copy: the forge still reports the
 # head pushed when the PR opened, but a later fix committed only in the copy
@@ -3701,6 +3726,7 @@ test_unpushed_named_head_refuses_registration
 test_a_wait_for_the_pr_record_is_not_printed_as_a_failure
 test_a_delivery_gate_refusal_is_printed_as_a_failure_naming_its_cause
 test_a_refusal_that_cannot_be_recorded_names_the_missing_record
+test_a_refusal_record_that_recording_cannot_clear_is_reported
 test_direct_pr_unpushed_commit_refuses_registration
 test_recording_refusal_is_recorded_and_cleared
 test_a_disproved_refusal_cause_states_what_the_rerun_saw
