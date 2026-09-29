@@ -761,6 +761,44 @@ test_unpushed_named_head_refuses_registration() {
   pass "fm-pr-check refuses to register a PR whose named head is only in the worker copy"
 }
 
+# The same named-head report is a wait while no record exists for the pull request
+# the report names, so it must not arrive with a failure's framing.
+test_a_wait_for_the_pr_record_is_not_printed_as_a_failure() {
+  local dir sha
+  dir=$(make_case wait-not-failure)
+  write_task_meta "$dir"
+  git -C "$dir/wt" commit -q --allow-empty -m 'only in the copy'
+  sha=$(git -C "$dir/wt" rev-parse HEAD)
+  FM_TEST_GH_HEAD=unavailable run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
+    > "$dir/stdout" 2> "$dir/stderr" && fail "a pull request with no record yet was registered"
+  grep -Fq "waiting on the PR record for https://github.com/o/r/pull/4" "$dir/stderr" \
+    || fail "the wait did not report itself waiting: $(cat "$dir/stderr")"
+  grep -Fq "named head $sha is not yet reachable outside the worker copy" "$dir/stderr" \
+    || fail "the wait lost the head it is waiting on: $(cat "$dir/stderr")"
+  ! grep -q '^error: ' "$dir/stderr" \
+    || fail "the wait was printed with a failure's framing: $(cat "$dir/stderr")"
+  pass "fm-pr-check waits for a pull request that has no record yet"
+}
+
+# A stored refusal makes the same report the lost-work alarm, so it keeps the error
+# treatment and the cause it names.
+test_a_delivery_gate_refusal_is_printed_as_a_failure_naming_its_cause() {
+  local dir
+  dir=$(make_case gate-refusal-names-cause)
+  write_task_meta "$dir"
+  git -C "$dir/wt" commit -q --allow-empty -m 'only in the copy'
+  FM_TEST_GH_DRAFT=true run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
+    > "$dir/stdout" 2> "$dir/stderr" && fail "a draft pull request was registered"
+  FM_TEST_GH_DRAFT=false FM_TEST_GH_HEAD=unavailable \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
+    > "$dir/stdout" 2> "$dir/stderr" && fail "a refused pull request was registered"
+  grep -Eq '^error: named head .+ is unreachable outside the worker copy' "$dir/stderr" \
+    || fail "the refusal was not printed as a failure: $(cat "$dir/stderr")"
+  grep -Eq 'and recording https://github.com/o/r/pull/4 was refused: .+' "$dir/stderr" \
+    || fail "the refusal named no cause: $(cat "$dir/stderr")"
+  pass "fm-pr-check prints a refusal as a failure naming its cause"
+}
+
 # A direct-PR worker pushes from its own copy: the forge still reports the
 # head pushed when the PR opened, but a later fix committed only in the copy
 # is the named head, so registration is refused.
@@ -843,8 +881,8 @@ test_a_disproved_refusal_cause_states_what_the_rerun_saw() {
   [ -f "$refusal" ] || fail "the draft refusal left no record: $(cat "$dir/stderr")"
   grep -qi 'draft' "$refusal" \
     || fail "the record lost the draft cause: $(cat "$refusal")"
-  # The draft is gone and the forge names no head, so this run reaches the
-  # delivery gate, which holds the report as waiting on the record it would write.
+  # The draft is gone and the forge names no head, so this run reaches the delivery
+  # gate, which refuses while naming the cause it read from the stored record.
   FM_TEST_GH_DRAFT=false FM_TEST_GH_HEAD=unavailable \
     run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
     > "$dir/stdout" 2> "$dir/stderr" && fail "a run with no forge head recorded the pull request"
@@ -3623,6 +3661,8 @@ test_draft_pull_request_is_not_armed
 test_secondmate_record_refuses_a_pr_watch
 test_a_gerrit_tooling_refusal_records_nothing
 test_unpushed_named_head_refuses_registration
+test_a_wait_for_the_pr_record_is_not_printed_as_a_failure
+test_a_delivery_gate_refusal_is_printed_as_a_failure_naming_its_cause
 test_direct_pr_unpushed_commit_refuses_registration
 test_recording_refusal_is_recorded_and_cleared
 test_a_disproved_refusal_cause_states_what_the_rerun_saw

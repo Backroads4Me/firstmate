@@ -4,8 +4,8 @@
 # Refuses when bin/fm-dod-lib.sh will not accept the named head as reachable
 # outside the worker's disposable copy; in no-mistakes mode a forge-reported
 # head is that named head and is already stored on the forge.
-# A refusal that names a state of the pull request itself - that it is not a
-# delivery lane, that its forge tooling is missing, that it is a draft - names its
+# A refusal that names a state of the pull request itself - that its forge tooling
+# is missing, that it is a draft - names its
 # reason on stderr and records it as this task's fm_dod_pr_refusal_reason, which
 # is what restores the lost-work alarm a ready report waits out; a later record
 # clears it; a run that reaches the delivery gate refreshes a stored cause to what
@@ -180,14 +180,19 @@ if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; }; then
   # its own: this step asked the reader about a report it built, so it cannot tell
   # an unsaved head from the recording window this step exists to close, and a
   # record of that verdict would turn the window into the durable lost-work alarm.
-  # What this run does retire is the cause an earlier run stored, because it passed
-  # every check that could state one: the record stands until a successful record
-  # clears it, and now says what this run saw.
+  # The wait is printed as a wait and stores nothing. A refusing run keeps the error
+  # treatment and retires the cause an earlier run stored, because it passed every
+  # check that could state one: the record stands until a successful record clears
+  # it, and now says what this run saw.
   if [ "$GATE_RC" -ne 0 ]; then
-    printf 'error: %s\n' "$GATE_REASON" >&2
-    if pr_check_refusal_lane; then
-      fm_dod_pr_refusal_refresh "$STATE" "$ID" "$URL" \
-        "the delivery gate did not accept this run's ready report" || true
+    if [ "$GATE_RC" -eq "$FM_DOD_RC_WAIT_PR_RECORD" ]; then
+      printf '%s\n' "$GATE_REASON" >&2
+    else
+      printf 'error: %s\n' "$GATE_REASON" >&2
+      if pr_check_refusal_lane; then
+        fm_dod_pr_refusal_refresh "$STATE" "$ID" "$URL" \
+          "the delivery gate did not accept this run's ready report" || true
+      fi
     fi
     exit 1
   fi
