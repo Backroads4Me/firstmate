@@ -654,8 +654,7 @@ fm_dod_pr_refusal_write() {  # <state> <id> <url> <reason>
   state_device=$(fm_pr_file_device "$state") || return 1
   marker="$state/$id.pr-record-refused"
   fm_pr_regular_destination_on_device_or_absent "$marker" "$state_device" || return 1
-  umask 077
-  tmp=$(mktemp "$state/.fm-pr-record-refused.XXXXXX") || return 1
+  tmp=$(umask 077; mktemp "$state/.fm-pr-record-refused.XXXXXX") || return 1
   if ! printf '%s\n%s\n%s\n%s\n' fm-pr-record-refused-v1 \
       "$FM_PR_PROVIDER" "$FM_PR_HOST" "$FM_PR_PATH" \
       > "$tmp" \
