@@ -81,7 +81,12 @@ pr_check_refusal_lane() {
 pr_check_refuse_pr() {  # <reason>
   printf 'error: %s\n' "$1" >&2
   if pr_check_refusal_lane; then
-    fm_dod_pr_refusal_write "$STATE" "$ID" "$URL" "$1" || true
+    # A refusal nobody recorded reads to the next reader as a pull request still
+    # waiting on its record, which is the pause this step exists to tell apart from
+    # the lost-work alarm. The verdict stops the record either way, so a write that
+    # cannot store the cause says so here rather than exiting quietly on it.
+    fm_dod_pr_refusal_write "$STATE" "$ID" "$URL" "$1" \
+      || printf 'error: could not record the refusal above for %s: a later read will see a record wait instead of this cause\n' "$URL" >&2
   fi
   exit 1
 }
@@ -187,12 +192,15 @@ if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; }; then
   if [ "$GATE_RC" -ne 0 ]; then
     if [ "$GATE_RC" -eq "$FM_DOD_RC_WAIT_PR_RECORD" ]; then
       printf '%s\n' "$GATE_REASON" >&2
-    else
-      printf 'error: %s\n' "$GATE_REASON" >&2
-      if pr_check_refusal_lane; then
-        fm_dod_pr_refusal_refresh "$STATE" "$ID" "$URL" \
-          "the delivery gate did not accept this run's ready report" || true
-      fi
+      # The wait leaves as the wait. A caller reading this script's status has to
+      # tell waiting on the record apart from a refused recording, and only the
+      # status the delivery gate returned itself says which.
+      exit "$FM_DOD_RC_WAIT_PR_RECORD"
+    fi
+    printf 'error: %s\n' "$GATE_REASON" >&2
+    if pr_check_refusal_lane; then
+      fm_dod_pr_refusal_refresh "$STATE" "$ID" "$URL" \
+        "the delivery gate did not accept this run's ready report" || true
     fi
     exit 1
   fi
@@ -253,8 +261,10 @@ fm_pr_metadata_identity_parse "$META" || exit 1
   && [ "$FM_PR_META_NUMBER" = "$NUMBER" ] || exit 1
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
-# The pull request is now recorded, so any earlier refusal of it is spent.
-fm_dod_pr_refusal_remove "$STATE" "$ID" || true
+# The pull request is now recorded, so any earlier refusal naming it is spent. A
+# refusal naming a different pull request belongs to another report's verdict, so
+# the removal is scoped by the identity the record itself carries.
+fm_dod_pr_refusal_remove "$STATE" "$ID" "$URL" || true
 
 PR_POLL_PUBLISH_LOCK="$STATE/.pr-poll-publish-$ID.lock"
 fm_lock_acquire_wait "$PR_POLL_PUBLISH_LOCK"

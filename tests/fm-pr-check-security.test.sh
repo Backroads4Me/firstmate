@@ -761,16 +761,33 @@ test_unpushed_named_head_refuses_registration() {
   pass "fm-pr-check refuses to register a PR whose named head is only in the worker copy"
 }
 
+# The status bin/fm-dod-lib.sh answers for a pull request whose record is missing,
+# read from the library that owns it so a caller-side test cannot drift from it.
+pr_check_wait_status() {
+  (
+    # shellcheck source=/dev/null
+    . "$ROOT/bin/fm-dod-lib.sh"
+    printf '%s\n' "$FM_DOD_RC_WAIT_PR_RECORD"
+  )
+}
+
 # The same named-head report is a wait while no record exists for the pull request
 # the report names, so it must not arrive with a failure's framing.
 test_a_wait_for_the_pr_record_is_not_printed_as_a_failure() {
-  local dir sha
+  local dir sha rc wait_rc
   dir=$(make_case wait-not-failure)
   write_task_meta "$dir"
   git -C "$dir/wt" commit -q --allow-empty -m 'only in the copy'
   sha=$(git -C "$dir/wt" rev-parse HEAD)
+  wait_rc=$(pr_check_wait_status)
+  rc=0
   FM_TEST_GH_HEAD=unavailable run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
-    > "$dir/stdout" 2> "$dir/stderr" && fail "a pull request with no record yet was registered"
+    > "$dir/stdout" 2> "$dir/stderr" || rc=$?
+  [ "$rc" -ne 0 ] || fail "a pull request with no record yet was registered"
+  # Read from the process rather than from a helper's return: this status is what
+  # a caller that runs the check has to work from.
+  [ "$rc" -eq "$wait_rc" ] \
+    || fail "the wait left status $rc, which a caller reads as a refused recording, not $wait_rc: $(cat "$dir/stderr")"
   grep -Fq "waiting on the PR record for https://github.com/o/r/pull/4" "$dir/stderr" \
     || fail "the wait did not report itself waiting: $(cat "$dir/stderr")"
   grep -Fq "named head $sha is not yet reachable outside the worker copy" "$dir/stderr" \
@@ -798,6 +815,26 @@ test_a_delivery_gate_refusal_is_printed_as_a_failure_naming_its_cause() {
     || fail "the refusal named no cause: $(cat "$dir/stderr")"
   pass "fm-pr-check prints a refusal as a failure naming its cause"
 }
+# A refusal nobody recorded reads to the next reader as a pull request still waiting
+# on its record, the very pause this step exists to tell apart from lost work. When
+# the record cannot be written, the run has to say so rather than leave that verdict
+# to a file that does not exist.
+test_a_refusal_that_cannot_be_recorded_names_the_missing_record() {
+  local dir
+  dir=$(make_case refusal-unrecordable)
+  write_task_meta "$dir"
+  git -C "$dir/wt" commit -q --allow-empty -m 'only in the copy'
+  # The record's own destination is a directory, so no private write can land there.
+  mkdir -p "$dir/home/state/task-a.pr-record-refused"
+  FM_TEST_GH_DRAFT=true run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
+    > "$dir/stdout" 2> "$dir/stderr" && fail "a draft pull request was registered"
+  grep -qi 'draft' "$dir/stderr" \
+    || fail "the refusal lost the cause it stated: $(cat "$dir/stderr")"
+  grep -Fq 'could not record the refusal above for https://github.com/o/r/pull/4' "$dir/stderr" \
+    || fail "a refusal nobody can read back was reported as an ordinary failure: $(cat "$dir/stderr")"
+  pass "a refusal that cannot be recorded names the record a later reader needs"
+}
+
 
 # A direct-PR worker pushes from its own copy: the forge still reports the
 # head pushed when the PR opened, but a later fix committed only in the copy
@@ -3663,6 +3700,7 @@ test_a_gerrit_tooling_refusal_records_nothing
 test_unpushed_named_head_refuses_registration
 test_a_wait_for_the_pr_record_is_not_printed_as_a_failure
 test_a_delivery_gate_refusal_is_printed_as_a_failure_naming_its_cause
+test_a_refusal_that_cannot_be_recorded_names_the_missing_record
 test_direct_pr_unpushed_commit_refuses_registration
 test_recording_refusal_is_recorded_and_cleared
 test_a_disproved_refusal_cause_states_what_the_rerun_saw

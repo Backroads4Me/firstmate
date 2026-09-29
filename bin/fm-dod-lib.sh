@@ -712,14 +712,20 @@ fm_dod_pr_refusal_refresh() {  # <state> <id> <url> <reason>
   fm_dod_pr_refusal_write "$state" "$id" "$url" "$reason"
 }
 
-# Drop the refusal record once a later run records the pull request, so a lane
-# that was refused and then fixed never reads as lost work again.
-fm_dod_pr_refusal_remove() {  # <state> <id>
-  local state=$1 id=$2 marker
+# Drop the refusal record once a later run records the pull request that refusal
+# named, so a lane that was refused and then fixed never reads as lost work again.
+# The record names the pull request it refused, so a run that recorded a different
+# one leaves it standing: a report naming the still-unrecorded pull request has to
+# keep reading as the refusal it was given. The identity comes from the record
+# itself, since the caller cannot see which pull request a stored line names.
+fm_dod_pr_refusal_remove() {  # <state> <id> <url>
+  local state=$1 id=$2 url=$3 marker
   fm_pr_task_id_valid "$id" || return 1
+  fm_pr_url_parse "$url" || return 1
   marker="$state/$id.pr-record-refused"
   [ -e "$marker" ] || [ -L "$marker" ] || return 0
   [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  fm_dod_pr_refusal_reason "$state" "$id" "$url" >/dev/null || return 1
   rm -f -- "$marker"
 }
 

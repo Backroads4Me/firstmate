@@ -468,12 +468,37 @@ test_recorded_recording_refusal_restores_the_alarm() {
   case "$reason" in
     *'unreachable outside the worker copy'*) fail "a refusal for another PR raised the alarm: $reason" ;;
   esac
-  fm_dod_pr_refusal_remove "$state" refused || fail "the recording refusal could not be cleared"
+  fm_dod_pr_refusal_remove "$state" refused "$url" || fail "the recording refusal could not be cleared"
   accept_done ship no-mistakes "$wt" "$repo" \
     "done [at=$(date +%s)]: PR $url checks green" "$state" refused "$meta" >/dev/null && rc=0 || rc=$?
   [ "$rc" -eq "$FM_DOD_RC_WAIT_PR_RECORD" ] \
     || fail "a cleared refusal still answered the gate (exit $rc)"
   pass "the recording step's refusal restores the alarm for its own pull request"
+}
+
+# One task can carry reports naming two pull requests. Recording one spends only
+# the refusal naming it, so a report naming the other still reads as the refusal
+# that was recorded for it.
+test_recording_one_pull_request_leaves_another_pull_request_s_refusal_intact() {
+  local state url_a url_b reason
+  state="$TMP_ROOT/two-pr-state"
+  mkdir -p "$state"
+  url_a=https://github.com/o/r/pull/20
+  url_b=https://github.com/o/r/pull/21
+  fm_dod_pr_refusal_write "$state" two_prs "$url_a" "$url_a is a draft pull request" \
+    || fail "the refusal for the first pull request could not be recorded"
+  fm_dod_pr_refusal_remove "$state" two_prs "$url_b" \
+    && fail "recording the second pull request cleared the first one's refusal"
+  reason=$(fm_dod_pr_refusal_reason "$state" two_prs "$url_a") \
+    || fail "the first refusal stopped being readable"
+  [ "$reason" = "$url_a is a draft pull request" ] \
+    || fail "the surviving refusal lost its cause: $reason"
+  fm_dod_pr_refusal_remove "$state" two_prs "$url_a" \
+    || fail "recording the refused pull request did not clear its own refusal"
+  if fm_dod_pr_refusal_reason "$state" two_prs "$url_a" >/dev/null; then
+    fail "the cleared refusal still reads back"
+  fi
+  pass "recording one pull request leaves another pull request's refusal intact"
 }
 
 # The wait states only what the reader can see. Nothing here measures elapsed
@@ -694,6 +719,7 @@ test_recorded_recording_refusal_restores_the_alarm
 test_the_wait_names_only_what_the_record_lacks
 test_a_re_recorded_refusal_keeps_only_this_runs_cause
 test_a_refusal_write_returns_the_mask_its_caller_came_in_with
+test_recording_one_pull_request_leaves_another_pull_request_s_refusal_intact
 test_every_other_unreachable_claim_still_refuses
 test_fenced_and_indented_captain_lines_are_not_intent
 test_pr_based_dod_draft_check_uses_gh_axi
