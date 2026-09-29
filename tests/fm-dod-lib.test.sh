@@ -21,6 +21,14 @@ write_merge_marker() {  # <state> <id> <provider> <host> <path> <number>
   chmod 600 "$1/$2.pr-poll-merge-notified"
 }
 
+file_mode() {  # the octal permission bits a path carries
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %Lp "$1"
+  else
+    stat -c %a "$1"
+  fi
+}
+
 test_scout_done_is_not_gated() {
   local repo wt
   repo="$TMP_ROOT/scout-repo"
@@ -554,6 +562,40 @@ test_a_re_recorded_refusal_keeps_only_this_runs_cause() {
   pass "a re-recorded refusal keeps only this run's cause inside one bounded line"
 }
 
+# The marker writer borrows a private mask to create its file, and a mask is
+# process-wide, so the only question a reader can act on is whether the caller
+# gets back the mask it handed in. The suite chooses its own mask, calls the writer
+# in its own shell the way a sourced caller does, and reads the mode a later write
+# produces on both sides of the call.
+test_a_refusal_write_returns_the_mask_its_caller_came_in_with() {
+  local state url marker before after probe_before probe_after mode_before mode_after
+  state="$TMP_ROOT/caller-mask-state"
+  mkdir -p "$state"
+  url=https://github.com/o/r/pull/20
+  # A mask of the caller's own choosing: a writer that merely reset the mask on the
+  # way out would still fail this check.
+  umask 002
+  before=$(umask)
+  probe_before="$TMP_ROOT/caller-mask-probe-before"
+  : > "$probe_before"
+  mode_before=$(file_mode "$probe_before")
+  fm_dod_pr_refusal_write "$state" masky "$url" "$url is a draft pull request" \
+    || fail "the refusal could not be recorded"
+  after=$(umask)
+  marker="$state/masky.pr-record-refused"
+  umask "$before"
+  [ "$before" = "$after" ] \
+    || fail "the writer left the caller holding mask $after instead of $before"
+  [ "$(file_mode "$marker")" = 600 ] \
+    || fail "the returned mask cost the marker its own privacy: $(file_mode "$marker")"
+  probe_after="$TMP_ROOT/caller-mask-probe-after"
+  : > "$probe_after"
+  mode_after=$(file_mode "$probe_after")
+  [ "$mode_before" = "$mode_after" ] \
+    || fail "a file the caller wrote after the refusal came out $mode_after, not $mode_before"
+  pass "a refusal write returns the mask its caller came in with and keeps its marker private"
+}
+
 # Only the named-but-unrecorded window changed. A note naming no pull request, a
 # URL that is not a canonical pull request, a local-only lane, and a recorded URL
 # whose head disagrees all keep today's refusal byte-for-byte, and no report that
@@ -651,6 +693,7 @@ test_recording_the_pr_accepts_the_same_done
 test_recorded_recording_refusal_restores_the_alarm
 test_the_wait_names_only_what_the_record_lacks
 test_a_re_recorded_refusal_keeps_only_this_runs_cause
+test_a_refusal_write_returns_the_mask_its_caller_came_in_with
 test_every_other_unreachable_claim_still_refuses
 test_fenced_and_indented_captain_lines_are_not_intent
 test_pr_based_dod_draft_check_uses_gh_axi
