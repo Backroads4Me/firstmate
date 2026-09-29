@@ -282,7 +282,7 @@ Evidence for 2.1.280 and the record-backed doorbell is also in its [2026-09-25 r
 
 - The function-hooks surface is early access and default-off.
   Claude Code states that its API may change between releases without notice.
-  The mod is verified on Claude Code 2.1.272, 2.1.280, 2.1.282, and 2.1.283 and refuses nothing newer.
+  The mod is verified on Claude Code 2.1.272, 2.1.280, 2.1.282, 2.1.283, and 2.1.284 and refuses nothing newer.
 - Firstmate's typed producers bound for a Claude Code pane ride the record-backed doorbell, so they hide like any operational row.
   Those producers are the away-mode daemon's escalations and a worker's launch brief.
   Only an envelope that reaches Claude Code some other way, as bare typed or launch-prompt text, arrives without its U+2063 and stays visible.
