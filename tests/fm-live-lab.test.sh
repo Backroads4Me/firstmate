@@ -108,6 +108,9 @@ make_lab() {
   printf '%s\n' "$root"
 }
 
+# Recorded fixture roots must not share the runner's process group.
+start_group() { perl -e 'setpgrp(0,0); exec @ARGV' "$@" >/dev/null 2>&1 & }
+
 record_pid() {  # <root> <pid>
   printf 'launch_pid=%s\nlaunch_start=%s\n' "$2" "$(ps -o lstart= -p "$2" | awk '{$1=$1; print}')" >> "$1/.fm-live-lab"
 }
@@ -316,10 +319,15 @@ printf '%s\n' "$STRAY" >> "$TMP_ROOT/pids"
 until STRAY_CHILD=$(pgrep -P "$STRAY" sleep); do sleep 0.1; done
 printf '%s\n' "$STRAY_CHILD" >> "$TMP_ROOT/pids"
 # A launch-recorded process and its child must be stopped even when not in tmux.
-sleep 600 >/dev/null 2>&1 &
+start_group sleep 600
 OWNED=$!
 printf '%s\n' "$OWNED" >> "$TMP_ROOT/pids"
 record_pid "$C" "$OWNED"
+# A process in the runner's group is not part of any recorded lab group.
+sleep 600 >/dev/null 2>&1 &
+UNRELATED=$!
+printf '%s\n' "$UNRELATED" >> "$TMP_ROOT/pids"
+[ "$(ps -o pgid= -p "$UNRELATED" | awk '{$1=$1; print}')" != "$(ps -o pgid= -p "$OWNED" | awk '{$1=$1; print}')" ] || fail "fixture roots must have their own group"
 # A sibling lab root that shares this root as a string prefix is not this lab.
 mkdir -p "${C}2"
 printf 'sleep 600\n' > "${C}2/stray.sh"
@@ -334,6 +342,7 @@ expect_code 0 "$?" "down of a clean Claude lab succeeds from a shell with anothe
 kill -0 "$STRAY" 2>/dev/null || fail "down leaves unrelated processes opening the lab path alone"
 kill -0 "$STRAY_CHILD" 2>/dev/null || fail "down leaves their descendants alone"
 ! kill -0 "$OWNED" 2>/dev/null || fail "down stops recorded launch processes"
+kill -0 "$UNRELATED" 2>/dev/null || fail "down signalled an unrelated process outside recorded groups"
 assert_absent "$C" "down removes the lab root"
 kill -0 "$SIBLING" 2>/dev/null || fail "down leaves a sibling root's process running"
 pkill -P "$SIBLING" 2>/dev/null
@@ -377,9 +386,9 @@ store=$1 key=$2 marker=$3
 trap 'sleep 1; node -e "const fs=require(\"node:fs\");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,\"utf8\"));j.projects[k]={hasTrustDialogAccepted:true};fs.writeFileSync(s,JSON.stringify(j))" "$store" "$key"; echo rewrote > "$marker"; exit 0' TERM
 while :; do sleep 0.1; done
 SH
-bash "$TMP_ROOT/exit-rewriter.sh" "$HOME/.claude.json" "$X/home" "$TMP_ROOT/rewrote" >/dev/null 2>&1 &
+start_group bash "$TMP_ROOT/exit-rewriter.sh" "$HOME/.claude.json" "$X/home" "$TMP_ROOT/rewrote"
 REWRITER=$!
-bash -c 'trap "" TERM; while :; do sleep 0.1; done' >/dev/null 2>&1 &
+start_group bash -c 'trap "" TERM; while :; do sleep 0.1; done'
 STUBBORN=$!
 sleep 0.2
 printf '%s\n%s\n' "$REWRITER" "$STUBBORN" >> "$TMP_ROOT/pids"
@@ -403,8 +412,9 @@ store=$1 key=$2 marker=$3
 trap 'sleep 1; node -e "const fs=require(\"node:fs\");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,\"utf8\"));j.projects[k]={hasTrustDialogAccepted:true};fs.writeFileSync(s,JSON.stringify(j))" "$store" "$key"; echo rewrote > "$marker"; exit 0' TERM
 while :; do sleep 0.1; done
 SH
-bash -c 'bash "$1" "$2" "$3" "$4" & echo $! > "$5"; while :; do sleep 0.1; done' _ \
-  "$TMP_ROOT/orphan-rewriter.sh" "$HOME/.claude.json" "$ORPHAN/home" "$TMP_ROOT/orphan-rewrote" "$TMP_ROOT/orphan-child" &
+# shellcheck disable=SC2016 # Positional parameters expand in the launched shell.
+start_group bash -c 'bash "$1" "$2" "$3" "$4" & echo $! > "$5"; while :; do sleep 0.1; done' _ \
+  "$TMP_ROOT/orphan-rewriter.sh" "$HOME/.claude.json" "$ORPHAN/home" "$TMP_ROOT/orphan-rewrote" "$TMP_ROOT/orphan-child"
 ORPHAN_ROOT=$!
 until [ -s "$TMP_ROOT/orphan-child" ]; do sleep 0.1; done
 ORPHAN_CHILD=$(cat "$TMP_ROOT/orphan-child")
@@ -421,10 +431,10 @@ pass "down waits for captured descendants after their root exits"
 LATE=$(make_lab late claude)
 cat > "$TMP_ROOT/late-rewriter.sh" <<'SH'
 store=$1 key=$2 marker=$3
-trap 'bash -c '\''sleep 1; node -e "const fs=require(\"node:fs\");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,\"utf8\"));j.projects[k]={hasTrustDialogAccepted:true};fs.writeFileSync(s,JSON.stringify(j))" "$1" "$2"'\'' _ "$store" "$key" >/dev/null 2>&1 & echo $! > "$marker"; sleep 0.4; exit 0' TERM
+trap 'bash -c '\''sleep 1; node -e "const fs=require(\"node:fs\");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,\"utf8\"));j.projects[k]={hasTrustDialogAccepted:true};fs.writeFileSync(s,JSON.stringify(j))" "$1" "$2"'\'' _ "$store" "$key" >/dev/null 2>&1 & echo $! > "$marker"; exit 0' TERM
 while :; do sleep 0.1; done
 SH
-bash "$TMP_ROOT/late-rewriter.sh" "$HOME/.claude.json" "$LATE/home" "$TMP_ROOT/late-child" >/dev/null 2>&1 &
+start_group bash "$TMP_ROOT/late-rewriter.sh" "$HOME/.claude.json" "$LATE/home" "$TMP_ROOT/late-child"
 LATE_ROOT=$!
 printf '%s\n' "$LATE_ROOT" >> "$TMP_ROOT/pids"
 record_pid "$LATE" "$LATE_ROOT"
@@ -440,7 +450,8 @@ pass "down tracks descendants spawned during TERM"
 
 # A reused PID with a different start time must not own its new process tree.
 Y=$(make_lab y claude)
-bash -c 'sleep 600 & echo $! > "$1"; wait' _ "$TMP_ROOT/reused-child" & REUSED=$!
+# shellcheck disable=SC2016 # Positional parameters expand in the launched shell.
+start_group bash -c 'sleep 600 & echo $! > "$1"; wait' _ "$TMP_ROOT/reused-child"; REUSED=$!
 until [ -s "$TMP_ROOT/reused-child" ]; do sleep 0.1; done
 REUSED_CHILD=$(cat "$TMP_ROOT/reused-child")
 printf '%s\n%s\n' "$REUSED" "$REUSED_CHILD" >> "$TMP_ROOT/pids"
@@ -454,7 +465,7 @@ pass "down ignores roots with mismatched start times"
 # Simulate a recorded PID changing identity after TERM: the first process
 # snapshot matches its start time, subsequent snapshots describe a reused PID.
 Z=$(make_lab z claude)
-python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)' &
+start_group python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)'
 REPLACED=$!
 printf '%s\n' "$REPLACED" >> "$TMP_ROOT/pids"
 record_pid "$Z" "$REPLACED"

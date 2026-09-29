@@ -614,25 +614,27 @@ lab_pids() {
     }'
 }
 
-# Extend the pre-kill snapshot with descendants of still-matching processes.
-# Retain old pairs so reparented children remain tracked after their root exits.
+# Extend the pre-kill snapshot with descendants of still-matching processes
+# and live members of captured lab process groups. Retain old pairs after reparenting.
 expand_pairs() {
-  awk '
+  awk -v groups="$2" '
+    BEGIN { split(groups, ids, /[[:space:]]+/); for (i in ids) if (ids[i] > 1) group[ids[i]]=1 }
     NR==FNR { split($0, fields, "\t"); if (fields[1] ~ /^[0-9]+$/) saved[fields[1]]=fields[2]; next }
     {
-      pid=$1; parent[pid]=$2; state[pid]=$3
-      start[pid]=$4 " " $5 " " $6 " " $7 " " $8
+      pid=$1; parent[pid]=$2; pgid[pid]=$3; state[pid]=$4
+      start[pid]=$5 " " $6 " " $7 " " $8 " " $9
       if (pid in saved && start[pid] == saved[pid] && state[pid] !~ /^Z/) owned[pid]=1
     }
     END {
       for (pid in saved) print pid "\t" saved[pid]
       for (pid in parent) {
         if (pid in saved || state[pid] ~ /^Z/) continue
+        if (pgid[pid] in group) { print pid "\t" start[pid]; continue }
         for (p=parent[pid]; p > 1 && (p in parent); p=parent[p]) {
           if (p in owned) { print pid "\t" start[pid]; break }
         }
       }
-    }' <(printf '%s\n' "$1") <(ps -axo pid=,ppid=,stat=,lstart=)
+    }' <(printf '%s\n' "$1") <(ps -axo pid=,ppid=,pgid=,stat=,lstart=)
 }
 
 # <pid TAB lstart> pairs captured before tmux shutdown. Recheck identity even
@@ -699,23 +701,29 @@ NODE
 
 cmd_down() {
   load_lab "${1:-}"
-  local rc=0 pids pairs pid start survivors n removed added id meta dir home_hash
+  local rc=0 pids pairs pid start survivors n removed added id meta dir home_hash groups pgid own_group caller_group
   local -a ids=()
   pids=$(lab_pids)
-  pairs=
+  pairs='' groups=''
+  own_group=$(ps -o pgid= -p "$$" | awk '{$1=$1; print}')
+  caller_group=$(ps -o pgid= -p "$PPID" | awk '{$1=$1; print}')
   for pid in $pids; do
     start=$(ps -o lstart= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')
-    [ -n "$start" ] && pairs+="$pid"$'\t'"$start"$'\n'
+    [ -n "$start" ] || continue
+    pairs+="$pid"$'\t'"$start"$'\n'
+    pgid=$(ps -o pgid=,lstart= -p "$pid" 2>/dev/null | awk -v start="$start" '{ if ($2 " " $3 " " $4 " " $5 " " $6 == start) print $1 }')
+    case "$pgid" in ''|0|1|*[!0-9]*) continue ;; esac
+    [ "$pgid" = "$own_group" ] || [ "$pgid" = "$caller_group" ] || groups+="$pgid "
   done
   lab_tmux kill-server 2>/dev/null || true
-  pairs=$(expand_pairs "$pairs")
+  pairs=$(expand_pairs "$pairs" "$groups")
   survivors=$(live_pids "$pairs")
   if [ -n "$survivors" ]; then
     # shellcheck disable=SC2086 # One identity-checked pid per word.
     kill $survivors 2>/dev/null || true
   fi
   for n in {1..40}; do
-    pairs=$(expand_pairs "$pairs")
+    pairs=$(expand_pairs "$pairs" "$groups")
     survivors=$(live_pids "$pairs")
     [ -n "$survivors" ] || break
     if [ "$n" -eq 20 ]; then
@@ -724,7 +732,7 @@ cmd_down() {
     fi
     sleep 0.5
   done
-  pairs=$(expand_pairs "$pairs")
+  pairs=$(expand_pairs "$pairs" "$groups")
   survivors=$(live_pids "$pairs")
   [ -z "$survivors" ] || die "refusing to remove the lab: its processes did not exit: $(echo "$survivors" | tr '\n' ' ')"
   echo "stopped: lab tmux server and lab processes"
