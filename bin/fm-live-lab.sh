@@ -634,7 +634,29 @@ expand_pairs() {
           if (p in owned) { print pid "\t" start[pid]; break }
         }
       }
-    }' <(printf '%s\n' "$1") <(ps -axo pid=,ppid=,pgid=,stat=,lstart=)
+    }' <(printf '%s\n' "$1") <(printf '%s\n' "$3")
+}
+
+# A group is eligible only while each scan still sees an identity-valid member.
+# Once absent, it is removed from the caller's group list and cannot be rediscovered.
+prune_groups() {
+  awk -v groups="$1" '
+    BEGIN { n=split(groups, ids, /[[:space:]]+/) }
+    NR==FNR { split($0, fields, "\t"); if (fields[1] ~ /^[0-9]+$/) saved[fields[1]]=fields[2]; next }
+    {
+      pid=$1; pgid=$3; state=$4
+      start=$5 " " $6 " " $7 " " $8 " " $9
+      if (state !~ /^Z/ && (!(pid in saved) || saved[pid] == start)) live[pgid]=1
+    }
+    END { for (i=1; i<=n; i++) if (ids[i] in live) printf "%s ", ids[i] }
+  ' <(printf '%s\n' "$2") <(printf '%s\n' "$3")
+}
+
+refresh_pairs() {
+  local snapshot
+  snapshot=$(ps -axo pid=,ppid=,pgid=,stat=,lstart=)
+  pairs=$(expand_pairs "$pairs" "$groups" "$snapshot")
+  groups=$(prune_groups "$groups" "$pairs" "$snapshot")
 }
 
 # <pid TAB lstart> pairs captured before tmux shutdown. Recheck identity even
@@ -716,14 +738,14 @@ cmd_down() {
     [ "$pgid" = "$own_group" ] || [ "$pgid" = "$caller_group" ] || groups+="$pgid "
   done
   lab_tmux kill-server 2>/dev/null || true
-  pairs=$(expand_pairs "$pairs" "$groups")
+  refresh_pairs
   survivors=$(live_pids "$pairs")
   if [ -n "$survivors" ]; then
     # shellcheck disable=SC2086 # One identity-checked pid per word.
     kill $survivors 2>/dev/null || true
   fi
   for n in {1..40}; do
-    pairs=$(expand_pairs "$pairs" "$groups")
+    refresh_pairs
     survivors=$(live_pids "$pairs")
     [ -n "$survivors" ] || break
     if [ "$n" -eq 20 ]; then
@@ -732,7 +754,7 @@ cmd_down() {
     fi
     sleep 0.5
   done
-  pairs=$(expand_pairs "$pairs" "$groups")
+  refresh_pairs
   survivors=$(live_pids "$pairs")
   [ -z "$survivors" ] || die "refusing to remove the lab: its processes did not exit: $(echo "$survivors" | tr '\n' ' ')"
   echo "stopped: lab tmux server and lab processes"

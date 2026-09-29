@@ -462,6 +462,45 @@ kill -0 "$REUSED" 2>/dev/null || fail "down killed a reused PID"
 kill -0 "$REUSED_CHILD" 2>/dev/null || fail "down killed the reused PID's child"
 pass "down ignores roots with mismatched start times"
 
+# A group observed empty must not be admitted again if its id is later reused.
+# The ps shim hides the first group's only member on pass 2, then presents an
+# unrelated process under that pgid on pass 3 while another lab group waits.
+GROUP_REUSE=$(make_lab group-reuse claude)
+start_group python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)'
+GROUP_ROOT=$!
+start_group python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)'
+WAIT_ROOT=$!
+sleep 0.2
+printf '%s\n%s\n' "$GROUP_ROOT" "$WAIT_ROOT" >> "$TMP_ROOT/pids"
+record_pid "$GROUP_REUSE" "$GROUP_ROOT"
+record_pid "$GROUP_REUSE" "$WAIT_ROOT"
+sleep 600 >/dev/null 2>&1 &
+GROUP_OUTSIDER=$!
+printf '%s\n' "$GROUP_OUTSIDER" >> "$TMP_ROOT/pids"
+GROUP_ID=$(ps -o pgid= -p "$GROUP_ROOT" | awk '{$1=$1; print}')
+mkdir -p "$TMP_ROOT/group-ps-bin"
+cat > "$TMP_ROOT/group-ps-bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -axo ] && [ "${2:-}" = 'pid=,ppid=,pgid=,stat=,lstart=' ]; then
+  count=$(cat "$PS_SCAN_COUNT" 2>/dev/null || echo 0)
+  count=$((count + 1))
+  echo "$count" > "$PS_SCAN_COUNT"
+  "$REAL_PS" "$@" | awk -v scan="$count" -v root="$PS_GROUP_ROOT" -v outsider="$PS_OUTSIDER" -v group="$PS_GROUP_ID" '
+    scan >= 2 && $1 == root { next }
+    scan >= 3 && $1 == outsider { $3=group }
+    { print }
+  '
+else
+  "$REAL_PS" "$@"
+fi
+SH
+chmod +x "$TMP_ROOT/group-ps-bin/ps"
+out=$(REAL_PS="$(command -v ps)" PS_SCAN_COUNT="$TMP_ROOT/group-scan-count" PS_GROUP_ROOT="$GROUP_ROOT" PS_OUTSIDER="$GROUP_OUTSIDER" PS_GROUP_ID="$GROUP_ID" PATH="$TMP_ROOT/group-ps-bin:$PATH" "$LIVE_LAB" down "$GROUP_REUSE" 2>&1)
+expect_code 0 "$?" "down ignores a reused group id: $out"
+[ "$(cat "$TMP_ROOT/group-scan-count")" -ge 3 ] || fail "fixture did not expose the reused group id"
+kill -0 "$GROUP_OUTSIDER" 2>/dev/null || fail "down signalled an unrelated process with a reused group id"
+pass "down drops empty groups permanently before their ids can be reused"
+
 # Simulate a recorded PID changing identity after TERM: the first process
 # snapshot matches its start time, subsequent snapshots describe a reused PID.
 Z=$(make_lab z claude)
