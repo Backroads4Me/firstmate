@@ -4,6 +4,15 @@
 # Refuses when bin/fm-dod-lib.sh will not accept the named head as reachable
 # outside the worker's disposable copy; in no-mistakes mode a forge-reported
 # head is that named head and is already stored on the forge.
+# A refusal that names a state of the pull request itself - that it is not a
+# delivery lane, that its forge tooling is missing, that it is a draft - names its
+# reason on stderr and records it as this task's fm_dod_pr_refusal_reason, which
+# is what restores the lost-work alarm a ready report waits out; a later record
+# clears it; a run that reaches the delivery gate refreshes a stored cause to what
+# it observed, because the check that stated it has since passed, and leaves the
+# verdict alone. The named-head refusal is printed without a record: this step asked
+# the reader about a report it built, so that refusal cannot tell an unsaved head
+# from the recording window this step exists to close.
 # The watcher check source is byte-for-byte bin/fm-pr-poll.sh; task and PR data
 # live only in a private sidecar and are never interpolated into shell source.
 # A GitHub pull request URL, a GitLab merge request URL, and a Gerrit change URL
@@ -49,6 +58,33 @@ PROVIDER=$FM_PR_PROVIDER
 HOST=$FM_PR_HOST
 PROJECT_PATH=$FM_PR_PATH
 NUMBER=$FM_PR_NUMBER
+# Once this pull request and this task are identified, a refusal the reader can
+# consult is recorded for bin/fm-dod-lib.sh before this script exits, which is
+# what turns a ready report back into the lost-work alarm instead of waiting out
+# a window; the next successful record clears it. Recording can only restore a
+# refusal the gate already makes, never accept a claim it would refuse, so it is
+# kept to the lanes that reader consults: a ship record on github or gitlab that
+# is not local-only. Any other refusal just exits, since a record there is state
+# nothing reads until teardown. Refusals of this script's own inputs are not here
+# because no pull request or task is identified to record against yet. A run that
+# reaches the delivery gate passed every check that could state a cause, so it
+# refreshes a stored cause to what it saw instead of leaving one it disproved;
+# pr_check_refusal_lane is the one lane rule for both writes.
+pr_check_refusal_lane() {
+  [ "${KIND:-ship}" = ship ] && [ "$MODE" != local-only ] || return 1
+  case "$PROVIDER" in
+    github|gitlab) return 0 ;;
+  esac
+  return 1
+}
+
+pr_check_refuse_pr() {  # <reason>
+  printf 'error: %s\n' "$1" >&2
+  if pr_check_refusal_lane; then
+    fm_dod_pr_refusal_write "$STATE" "$ID" "$URL" "$1" || true
+  fi
+  exit 1
+}
 
 # Task-derived paths are constructed only after the canonical ID validation.
 META="$STATE/$ID.meta"
@@ -63,9 +99,9 @@ fi
 # arming a merge watch here would queue the mate itself for teardown as landed
 # work once that pull request merges.
 KIND=$(grep '^kind=' "$META" | tail -1 | cut -d= -f2- || true)
+MODE=$(grep '^mode=' "$META" | tail -1 | cut -d= -f2- || true)
 if [ "$KIND" = secondmate ]; then
-  echo "error: $ID is a secondmate, not a delivery lane - $URL was reported on its status channel but belongs to a task in the mate's own home, which arms its own merge watch" >&2
-  exit 1
+  pr_check_refuse_pr "$ID is a secondmate, not a delivery lane - $URL was reported on its status channel but belongs to a task in the mate's own home, which arms its own merge watch"
 fi
 
 # A prior exact merged result may have queued its durable wake immediately
@@ -84,17 +120,14 @@ fm_pr_poll_retirement_recover_one "$STATE" "$ID" "$SCRIPT_DIR/fm-pr-poll.sh" || 
 # structured record rather than off a rendered line: the tool's own table prints
 # a change's subject before its status, and a subject is free text.
 if [ "$PROVIDER" = gitlab ] && ! command -v glab >/dev/null 2>&1; then
-  echo "error: watching a GitLab merge request requires glab on PATH" >&2
-  exit 1
+  pr_check_refuse_pr "watching a GitLab merge request requires glab on PATH"
 fi
 if [ "$PROVIDER" = gerrit ]; then
   if ! command -v gerrit-axi >/dev/null 2>&1; then
-    echo "error: watching a Gerrit change requires gerrit-axi on PATH" >&2
-    exit 1
+    pr_check_refuse_pr "watching a Gerrit change requires gerrit-axi on PATH"
   fi
   if ! command -v jq >/dev/null 2>&1; then
-    echo "error: watching a Gerrit change requires jq on PATH" >&2
-    exit 1
+    pr_check_refuse_pr "watching a Gerrit change requires jq on PATH"
   fi
 fi
 
@@ -103,8 +136,7 @@ fi
 if [ "$PROVIDER" = github ] && [ "${FM_PR_CHECK_MERGE:-}" != 1 ] && command -v gh >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
   DRAFT_JSON=$(gh pr view "$URL" --json isDraft 2>/dev/null || true)
   if [ "$(fm_pr_json_draft_state "$DRAFT_JSON")" = true ]; then
-    echo "error: $URL is a draft pull request; a draft cannot be merged, so merge monitoring would wait for an event that cannot occur - mark it ready for review and arm again, or declare a wait instead of done if the draft is deliberate" >&2
-    exit 1
+    pr_check_refuse_pr "$URL is a draft pull request; a draft cannot be merged, so merge monitoring would wait for an event that cannot occur - mark it ready for review and arm again, or declare a wait instead of done if the draft is deliberate"
   fi
 fi
 
@@ -133,7 +165,6 @@ if [ "$PROVIDER" = github ] && [ -n "$WT" ] && [ -d "$WT" ] && command -v gh >/d
   fi
 fi
 
-MODE=$(grep '^mode=' "$META" | tail -1 | cut -d= -f2- || true)
 PROJECT=$(grep '^project=' "$META" | tail -1 | cut -d= -f2- || true)
 # The gate is asked about the ready report this task's worker was told to give;
 # on a Gerrit change both publishing modes report the same published line.
@@ -142,10 +173,24 @@ case "$PROVIDER:$MODE" in
   *:no-mistakes|*:) DONE_LINE="done: PR $URL checks green" ;;
   *) DONE_LINE="done: PR $URL" ;;
 esac
-if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; } \
-  && ! GATE_REASON=$(fm_dod_accept_ship_done "${KIND:-ship}" "$MODE" "$WT" "$PROJECT" "$DONE_LINE" "$STATE" "$ID" "$META"); then
-  echo "error: $GATE_REASON" >&2
-  exit 1
+if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; }; then
+  GATE_RC=0
+  GATE_REASON=$(fm_dod_accept_ship_done "${KIND:-ship}" "$MODE" "$WT" "$PROJECT" "$DONE_LINE" "$STATE" "$ID" "$META") || GATE_RC=$?
+  # Either non-zero verdict stops recording here, and neither becomes a record of
+  # its own: this step asked the reader about a report it built, so it cannot tell
+  # an unsaved head from the recording window this step exists to close, and a
+  # record of that verdict would turn the window into the durable lost-work alarm.
+  # What this run does retire is the cause an earlier run stored, because it passed
+  # every check that could state one: the record stands until a successful record
+  # clears it, and now says what this run saw.
+  if [ "$GATE_RC" -ne 0 ]; then
+    printf 'error: %s\n' "$GATE_REASON" >&2
+    if pr_check_refusal_lane; then
+      fm_dod_pr_refusal_refresh "$STATE" "$ID" "$URL" \
+        "the delivery gate did not accept this run's ready report" || true
+    fi
+    exit 1
+  fi
 fi
 
 META_TMP=
@@ -203,6 +248,8 @@ fm_pr_metadata_identity_parse "$META" || exit 1
   && [ "$FM_PR_META_NUMBER" = "$NUMBER" ] || exit 1
 fm_lock_release "$META_LOCK"
 META_LOCK_HELD=0
+# The pull request is now recorded, so any earlier refusal of it is spent.
+fm_dod_pr_refusal_remove "$STATE" "$ID" || true
 
 PR_POLL_PUBLISH_LOCK="$STATE/.pr-poll-publish-$ID.lock"
 fm_lock_acquire_wait "$PR_POLL_PUBLISH_LOCK"
