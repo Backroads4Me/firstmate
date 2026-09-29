@@ -614,6 +614,27 @@ lab_pids() {
     }'
 }
 
+# Extend the pre-kill snapshot with descendants of still-matching processes.
+# Retain old pairs so reparented children remain tracked after their root exits.
+expand_pairs() {
+  awk '
+    NR==FNR { split($0, fields, "\t"); if (fields[1] ~ /^[0-9]+$/) saved[fields[1]]=fields[2]; next }
+    {
+      pid=$1; parent[pid]=$2; state[pid]=$3
+      start[pid]=$4 " " $5 " " $6 " " $7 " " $8
+      if (pid in saved && start[pid] == saved[pid] && state[pid] !~ /^Z/) owned[pid]=1
+    }
+    END {
+      for (pid in saved) print pid "\t" saved[pid]
+      for (pid in parent) {
+        if (pid in saved || state[pid] ~ /^Z/) continue
+        for (p=parent[pid]; p > 1 && (p in parent); p=parent[p]) {
+          if (p in owned) { print pid "\t" start[pid]; break }
+        }
+      }
+    }' <(printf '%s\n' "$1") <(ps -axo pid=,ppid=,stat=,lstart=)
+}
+
 # <pid TAB lstart> pairs captured before tmux shutdown. Recheck identity even
 # after a root exits and its children are reparented or a PID is reused.
 live_pids() {
@@ -687,12 +708,14 @@ cmd_down() {
     [ -n "$start" ] && pairs+="$pid"$'\t'"$start"$'\n'
   done
   lab_tmux kill-server 2>/dev/null || true
+  pairs=$(expand_pairs "$pairs")
   survivors=$(live_pids "$pairs")
   if [ -n "$survivors" ]; then
     # shellcheck disable=SC2086 # One identity-checked pid per word.
     kill $survivors 2>/dev/null || true
   fi
   for n in {1..40}; do
+    pairs=$(expand_pairs "$pairs")
     survivors=$(live_pids "$pairs")
     [ -n "$survivors" ] || break
     if [ "$n" -eq 20 ]; then
@@ -701,6 +724,7 @@ cmd_down() {
     fi
     sleep 0.5
   done
+  pairs=$(expand_pairs "$pairs")
   survivors=$(live_pids "$pairs")
   [ -z "$survivors" ] || die "refusing to remove the lab: its processes did not exit: $(echo "$survivors" | tr '\n' ' ')"
   echo "stopped: lab tmux server and lab processes"

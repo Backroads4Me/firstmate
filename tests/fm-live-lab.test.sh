@@ -18,8 +18,11 @@ LIVE_LAB="$ROOT/bin/fm-live-lab.sh"
 TRUST="$ROOT/bin/fm-claude-trust.sh"
 
 live_lab_cleanup() {
-  local dir pid
-  while read -r pid; do [ -n "$pid" ] && kill "$pid" 2>/dev/null; done < "$TMP_ROOT/pids"
+  local dir pid marker
+  for marker in "$TMP_ROOT/orphan-child" "$TMP_ROOT/late-child" "$TMP_ROOT/reused-child"; do
+    [ ! -s "$marker" ] || printf '%s\n' "$(<"$marker")" >> "$TMP_ROOT/pids"
+  done
+  while read -r pid; do [ -n "$pid" ] && { pkill -P "$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true; }; done < "$TMP_ROOT/pids"
   while read -r dir; do
     [ -n "$dir" ] || continue
     env -u TMUX TMUX_TMPDIR="$dir" tmux kill-server 2>/dev/null
@@ -307,14 +310,15 @@ fm_write_meta "$CH/state/$OTHER_ID.meta" "window=firstmate:fm-$OTHER_ID" "tasktm
 mkdir -p "/tmp/fm-$WORKER_ID/gotmp" "/tmp/fm-$MATE_ID" "/tmp/fm-$WORKER_ID+$C_HASH" "/tmp/fm-$OTHER_ID+$C_HASH" "/tmp/fm-$OTHER_ID"
 # An outsider opening a lab path is not owned by the lab.
 printf 'sleep 600\n' > "$C/stray.sh"
-bash "$C/stray.sh" &
+bash "$C/stray.sh" >/dev/null 2>&1 &
 STRAY=$!
 printf '%s\n' "$STRAY" >> "$TMP_ROOT/pids"
 until STRAY_CHILD=$(pgrep -P "$STRAY" sleep); do sleep 0.1; done
 printf '%s\n' "$STRAY_CHILD" >> "$TMP_ROOT/pids"
 # A launch-recorded process and its child must be stopped even when not in tmux.
-sleep 600 &
+sleep 600 >/dev/null 2>&1 &
 OWNED=$!
+printf '%s\n' "$OWNED" >> "$TMP_ROOT/pids"
 record_pid "$C" "$OWNED"
 # A sibling lab root that shares this root as a string prefix is not this lab.
 mkdir -p "${C}2"
@@ -373,9 +377,9 @@ store=$1 key=$2 marker=$3
 trap 'sleep 1; node -e "const fs=require(\"node:fs\");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,\"utf8\"));j.projects[k]={hasTrustDialogAccepted:true};fs.writeFileSync(s,JSON.stringify(j))" "$store" "$key"; echo rewrote > "$marker"; exit 0' TERM
 while :; do sleep 0.1; done
 SH
-bash "$TMP_ROOT/exit-rewriter.sh" "$HOME/.claude.json" "$X/home" "$TMP_ROOT/rewrote" &
+bash "$TMP_ROOT/exit-rewriter.sh" "$HOME/.claude.json" "$X/home" "$TMP_ROOT/rewrote" >/dev/null 2>&1 &
 REWRITER=$!
-bash -c 'trap "" TERM; while :; do sleep 0.1; done' &
+bash -c 'trap "" TERM; while :; do sleep 0.1; done' >/dev/null 2>&1 &
 STUBBORN=$!
 sleep 0.2
 printf '%s\n%s\n' "$REWRITER" "$STUBBORN" >> "$TMP_ROOT/pids"
@@ -412,6 +416,27 @@ assert_equals rewrote "$(cat "$TMP_ROOT/orphan-rewrote" 2>/dev/null)" "child fin
 lab_keys=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));console.log(Object.keys(j.projects).filter(k=>k.startsWith(process.argv[2])).join(" "))' "$HOME/.claude.json" "$ORPHAN")
 assert_equals "" "$lab_keys" "reparented child cannot re-add trust after down"
 pass "down waits for captured descendants after their root exits"
+
+# A recorded process can create a new descendant only after TERM arrives.
+LATE=$(make_lab late claude)
+cat > "$TMP_ROOT/late-rewriter.sh" <<'SH'
+store=$1 key=$2 marker=$3
+trap 'bash -c '\''sleep 1; node -e "const fs=require(\"node:fs\");const [s,k]=process.argv.slice(1);const j=JSON.parse(fs.readFileSync(s,\"utf8\"));j.projects[k]={hasTrustDialogAccepted:true};fs.writeFileSync(s,JSON.stringify(j))" "$1" "$2"'\'' _ "$store" "$key" >/dev/null 2>&1 & echo $! > "$marker"; sleep 0.4; exit 0' TERM
+while :; do sleep 0.1; done
+SH
+bash "$TMP_ROOT/late-rewriter.sh" "$HOME/.claude.json" "$LATE/home" "$TMP_ROOT/late-child" >/dev/null 2>&1 &
+LATE_ROOT=$!
+printf '%s\n' "$LATE_ROOT" >> "$TMP_ROOT/pids"
+record_pid "$LATE" "$LATE_ROOT"
+out=$("$LIVE_LAB" down "$LATE" 2>&1)
+expect_code 0 "$?" "down waits for a child born during TERM: $out"
+assert_present "$TMP_ROOT/late-child" "TERM handler spawned a child"
+LATE_CHILD=$(cat "$TMP_ROOT/late-child")
+printf '%s\n' "$LATE_CHILD" >> "$TMP_ROOT/pids"
+case "$(ps -o stat= -p "$LATE_CHILD" 2>/dev/null | awk '{$1=$1; print}')" in ''|Z*) ;; *) fail "down leaves a TERM-spawned child alive" ;; esac
+lab_keys=$(node -e 'const j=JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"));console.log(Object.keys(j.projects).filter(k=>k.startsWith(process.argv[2])).join(" "))' "$HOME/.claude.json" "$LATE")
+assert_equals "" "$lab_keys" "TERM-spawned child cannot re-add trust after down"
+pass "down tracks descendants spawned during TERM"
 
 # A reused PID with a different start time must not own its new process tree.
 Y=$(make_lab y claude)
@@ -487,7 +512,11 @@ pass "up refuses an existing root and an unsupported harness"
 # launching a harness; down can still clean this partial lab.
 PARTIAL="$TMP_ROOT/partial-lab"
 mkdir -p "$TMP_ROOT/stub-bin"
-printf '#!/bin/sh\nexit 99\n' > "$TMP_ROOT/stub-bin/claude"
+cat > "$TMP_ROOT/stub-bin/claude" <<'SH'
+#!/bin/sh
+: > "$FM_HOME/state/.session-start-complete"
+exec sleep 45 >/dev/null 2>&1
+SH
 chmod +x "$TMP_ROOT/stub-bin/claude"
 out=$(PATH="$TMP_ROOT/stub-bin:$PATH" "$LIVE_LAB" up --harness claude --source "$TMP_ROOT/missing-origin" "$PARTIAL" 2>&1)
 expect_code 1 "$?" "an unavailable source stops up before launch"
@@ -526,14 +555,16 @@ SH
 cat > "$WORKSRC/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
 id=$1
-tmux new-window -d -t firstmate: -n "fm-$id" -c "$FM_HOME" 'exec sleep 600' || exit 1
-# Wait for tmux to publish the real pane PID before the builder records it.
+tmux new-window -d -t firstmate: -n "fm-$id" -c "$FM_HOME" 'exec sleep 45 >/dev/null 2>&1' || exit 1
+# A missing =name can silently resolve to the current window: verify the name.
 for (( n=0; n<30; n++ )); do
-  pid=$(tmux display-message -p -t "firstmate:=fm-$id" '#{pane_pid}')
-  [ -z "$pid" ] || break
+  if tmux list-windows -t firstmate -F '#{window_name}' | grep -Fxq "fm-$id"; then
+    pid=$(tmux display-message -p -t "firstmate:=fm-$id" '#{pane_pid}')
+    [ -z "$pid" ] || break
+  fi
   sleep 0.1
 done
-[ -n "$pid" ] || exit 1
+[ -n "${pid:-}" ] || exit 1
 printf 'window=firstmate:fm-%s\n' "$id" > "$FM_HOME/state/$id.meta"
 printf 'working [at=1]: setting up\n' > "$FM_HOME/state/$id.status"
 SH
@@ -541,7 +572,7 @@ chmod +x "$WORKSRC/bin/"{fm-brief,fm-tasks-axi,fm-spawn}.sh
 git -C "$WORKSRC" add -A
 git -C "$WORKSRC" -c user.name=t -c user.email=t@example.invalid commit -qm stubs
 W="$TMP_ROOT/worker-up"
-out=$(PATH="$TMP_ROOT/stub-bin:$PATH" "$LIVE_LAB" up --harness claude --worker --source "$WORKSRC" --timeout 0 "$W" 2>&1)
+out=$(SHELL=/bin/sh PATH="$TMP_ROOT/stub-bin:$PATH" "$LIVE_LAB" up --harness claude --worker --source "$WORKSRC" --timeout 0 "$W" 2>&1)
 expect_code 1 "$?" "unanswered probe leaves worker lab for inspection: $out"
 assert_contains "$out" "primary: claude" "the unparked worker did not block primary launch"
 assert_contains "$out" "gate: $W/home/data/" "up shows the gate path"
@@ -569,7 +600,7 @@ SH
 git -C "$WORKSRC" add bin/fm-spawn.sh
 git -C "$WORKSRC" -c user.name=t -c user.email=t@example.invalid commit -qm missing-pane
 NO_PANE="$TMP_ROOT/no-pane"
-out=$(PATH="$TMP_ROOT/stub-bin:$PATH" "$LIVE_LAB" up --harness claude --worker --source "$WORKSRC" --timeout 0 "$NO_PANE" 2>&1)
+out=$(SHELL=/bin/sh PATH="$TMP_ROOT/stub-bin:$PATH" "$LIVE_LAB" up --harness claude --worker --source "$WORKSRC" --timeout 0 "$NO_PANE" 2>&1)
 expect_code 1 "$?" "up refuses a worker without a pane PID: $out"
 assert_contains "$out" "cannot record lab process: missing or invalid PID ''" "missing pane PID fails at launch recording"
 assert_not_contains "$out" "list of process IDs must follow -p" "ps never receives an empty PID"
@@ -588,7 +619,7 @@ else
   echo absent > "$FM_HOME/../claude-launch-trust"
 fi
 : > "$FM_HOME/state/.session-start-complete"
-exec sleep 600
+exec sleep 45 >/dev/null 2>&1
 SH
 chmod +x "$FAKEBIN/claude"
 U="$TMP_ROOT/up-lab"
@@ -604,7 +635,7 @@ U="$TMP_ROOT/up-lab"
 ) &
 RIVAL=$!
 printf '%s\n' "$RIVAL" >> "$TMP_ROOT/pids"
-out=$(PATH="$FAKEBIN:$PATH" "$LIVE_LAB" up --harness claude --source "$UPSRC" --ref HEAD --timeout 1 "$U" 2>&1)
+out=$(SHELL=/bin/sh PATH="$FAKEBIN:$PATH" "$LIVE_LAB" up --harness claude --source "$UPSRC" --ref HEAD --timeout 1 "$U" 2>&1)
 expect_code 1 "$?" "stand-in primary does not answer probe"
 wait "$RIVAL" 2>/dev/null || true
 assert_equals dropped "$(cat "$TMP_ROOT/rival-dropped" 2>/dev/null)" "rival dropped primary trust once"
