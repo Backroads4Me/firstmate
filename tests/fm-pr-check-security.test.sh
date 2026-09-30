@@ -969,6 +969,39 @@ test_a_disproved_refusal_cause_states_what_the_rerun_saw() {
   pass "a rerun that disproved the stored cause leaves the alarm naming what it saw"
 }
 
+# What a refusing run reports is the cause its record carries once this run has
+# brought it up to date, so a run that passed the check that stated an earlier cause
+# reports its own instead of repeating one it disproved. The status stays a refusal,
+# never the wait a pull request with no record yet is given.
+test_the_rerun_reports_the_cause_it_observed_not_the_stored_one() {
+  local dir refusal rc
+  dir=$(make_case refusal-cause-reported)
+  write_task_meta "$dir"
+  git -C "$dir/wt" commit -q --allow-empty -m 'only in the copy'
+  refusal="$dir/home/state/task-a.pr-record-refused"
+  FM_TEST_GH_DRAFT=true run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
+    > "$dir/stdout" 2> "$dir/stderr" && fail "a draft pull request was recorded"
+  [ -f "$refusal" ] || fail "the draft refusal left no record: $(cat "$dir/stderr")"
+  # The draft is resolved and the forge names no head, so this run reaches the
+  # delivery gate while the earlier cause is still the one on disk.
+  rc=0
+  FM_TEST_GH_DRAFT=false FM_TEST_GH_HEAD=unavailable \
+    run_check_entry "$dir" task-a https://github.com/o/r/pull/4 \
+    > "$dir/stdout" 2> "$dir/rerun.stderr" || rc=$?
+  [ "$rc" -eq 1 ] \
+    || fail "a refused recording left status $rc rather than a refusal: $(cat "$dir/rerun.stderr")"
+  grep -Fq 'and recording https://github.com/o/r/pull/4 was refused: ' "$dir/rerun.stderr" \
+    || fail "the rerun did not reach the delivery gate: $(cat "$dir/rerun.stderr")"
+  if grep -qi 'draft' "$dir/rerun.stderr"; then
+    fail "the rerun reported the cause it disproved: $(cat "$dir/rerun.stderr")"
+  fi
+  grep -Fq "the delivery gate did not accept this run's ready report" "$dir/rerun.stderr" \
+    || fail "the rerun named no cause of its own: $(cat "$dir/rerun.stderr")"
+  [ -f "$refusal" ] \
+    || fail "a run that recorded nothing cleared the refusal a later read needs"
+  pass "a refusing run reports the cause it observed rather than the stored one"
+}
+
 # A run that fails the very same check again learned nothing, so the stored cause
 # is left exactly as it was: refreshing it is for a run that passed the check.
 test_a_run_that_failed_the_same_check_leaves_the_cause_alone() {
@@ -3730,6 +3763,7 @@ test_a_refusal_record_that_recording_cannot_clear_is_reported
 test_direct_pr_unpushed_commit_refuses_registration
 test_recording_refusal_is_recorded_and_cleared
 test_a_disproved_refusal_cause_states_what_the_rerun_saw
+test_the_rerun_reports_the_cause_it_observed_not_the_stored_one
 test_a_run_that_failed_the_same_check_leaves_the_cause_alone
 test_valid_recording_and_merge_derivation
 test_rejected_metacharacter_bytes_are_inert

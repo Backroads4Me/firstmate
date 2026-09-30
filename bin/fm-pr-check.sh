@@ -179,16 +179,22 @@ case "$PROVIDER:$MODE" in
   *) DONE_LINE="done: PR $URL" ;;
 esac
 if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; }; then
+# Ask the delivery gate about this run's ready report: GATE_RC carries its verdict
+# and GATE_REASON carries the one-line cause it stated.
+pr_check_delivery_gate() {
   GATE_RC=0
-  GATE_REASON=$(fm_dod_accept_ship_done "${KIND:-ship}" "$MODE" "$WT" "$PROJECT" "$DONE_LINE" "$STATE" "$ID" "$META") || GATE_RC=$?
+  GATE_REASON=$(fm_dod_accept_ship_done "${KIND:-ship}" "$MODE" "$WT" "$PROJECT" \
+    "$DONE_LINE" "$STATE" "$ID" "$META") || GATE_RC=$?
+}
+pr_check_delivery_gate
   # Either non-zero verdict stops recording here, and neither becomes a record of
   # its own: this step asked the reader about a report it built, so it cannot tell
   # an unsaved head from the recording window this step exists to close, and a
   # record of that verdict would turn the window into the durable lost-work alarm.
   # The wait is printed as a wait and stores nothing. A refusing run keeps the error
-  # treatment and retires the cause an earlier run stored, because it passed every
-  # check that could state one: the record stands until a successful record clears
-  # it, and now says what this run saw.
+  # treatment and brings the cause an earlier run stored up to date, because it passed
+  # every check that could state one: the record stands until a successful record
+  # clears it, and the cause a refusing run states is always the current one.
   if [ "$GATE_RC" -ne 0 ]; then
     if [ "$GATE_RC" -eq "$FM_DOD_RC_WAIT_PR_RECORD" ]; then
       printf '%s\n' "$GATE_REASON" >&2
@@ -197,11 +203,19 @@ if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; }; then
       # status the delivery gate returned itself says which.
       exit "$FM_DOD_RC_WAIT_PR_RECORD"
     fi
-    printf 'error: %s\n' "$GATE_REASON" >&2
-    if pr_check_refusal_lane; then
-      fm_dod_pr_refusal_refresh "$STATE" "$ID" "$URL" \
-        "the delivery gate did not accept this run's ready report" || true
+    # A stored cause quotes what the run that wrote it observed, so the record is
+    # brought to what this run saw before the cause is read back from it. Where
+    # there was nothing to refresh, or the record names another pull request, this
+    # run's own gate verdict is what gets stated.
+    GATE_CAUSE=$GATE_REASON
+    if pr_check_refusal_lane && fm_dod_pr_refusal_refresh "$STATE" "$ID" "$URL" \
+        "the delivery gate did not accept this run's ready report"; then
+      pr_check_delivery_gate
+      if [ "$GATE_RC" -ne 1 ] || [ -z "$GATE_REASON" ]; then
+        GATE_REASON=$GATE_CAUSE
+      fi
     fi
+    printf 'error: %s\n' "$GATE_REASON" >&2
     exit 1
   fi
 fi
