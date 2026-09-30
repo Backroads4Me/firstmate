@@ -179,14 +179,9 @@ case "$PROVIDER:$MODE" in
   *) DONE_LINE="done: PR $URL" ;;
 esac
 if { [ -z "$PR_HEAD" ] || ! fm_dod_forge_head_is_named_head "$MODE"; }; then
-# Ask the delivery gate about this run's ready report: GATE_RC carries its verdict
-# and GATE_REASON carries the one-line cause it stated.
-pr_check_delivery_gate() {
   GATE_RC=0
   GATE_REASON=$(fm_dod_accept_ship_done "${KIND:-ship}" "$MODE" "$WT" "$PROJECT" \
     "$DONE_LINE" "$STATE" "$ID" "$META") || GATE_RC=$?
-}
-pr_check_delivery_gate
   # Either non-zero verdict stops recording here, and neither becomes a record of
   # its own: this step asked the reader about a report it built, so it cannot tell
   # an unsaved head from the recording window this step exists to close, and a
@@ -204,16 +199,16 @@ pr_check_delivery_gate
       exit "$FM_DOD_RC_WAIT_PR_RECORD"
     fi
     # A stored cause quotes what the run that wrote it observed, so the record is
-    # brought to what this run saw before the cause is read back from it. Where
-    # there was nothing to refresh, or the record names another pull request, this
-    # run's own gate verdict is what gets stated.
-    GATE_CAUSE=$GATE_REASON
+    # brought to what this run saw and the cause the gate quoted is replaced with
+    # the one the record now carries. The gate's verdict itself is the one this run
+    # already has: it is not asked again. Where there was nothing to refresh, or the
+    # record names another pull request, the gate's own line is stated as it came.
     if pr_check_refusal_lane && fm_dod_pr_refusal_refresh "$STATE" "$ID" "$URL" \
-        "the delivery gate did not accept this run's ready report"; then
-      pr_check_delivery_gate
-      if [ "$GATE_RC" -ne 1 ] || [ -z "$GATE_REASON" ]; then
-        GATE_REASON=$GATE_CAUSE
-      fi
+        "the delivery gate did not accept this run's ready report" \
+      && GATE_CAUSE=$(fm_dod_pr_refusal_reason "$STATE" "$ID" "$URL"); then
+      case "$GATE_REASON" in
+        *' was refused: '*) GATE_REASON="${GATE_REASON%% was refused: *} was refused: $GATE_CAUSE" ;;
+      esac
     fi
     printf 'error: %s\n' "$GATE_REASON" >&2
     exit 1
